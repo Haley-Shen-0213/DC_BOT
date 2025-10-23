@@ -3,6 +3,7 @@ import sys
 import re
 import time
 import asyncio
+import aiohttp
 import datetime
 import contextlib
 import discord
@@ -11,6 +12,11 @@ from bs4 import BeautifulSoup
 from urllib.parse import urlparse, urljoin
 from dotenv import load_dotenv
 from pathlib import Path
+# ===== YouTube 監控（新增）=====
+import threading
+import json
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
 def get_base_dir() -> Path:
     # 若是打包為 exe，使用 exe 所在目錄；否則使用腳本所在目錄
@@ -27,7 +33,10 @@ load_dotenv(dotenv_path=str(ENV_PATH), override=False)
 # ===== 檔案與日誌設定 =====
 LOG_DIR = BASE_DIR / "log"
 os.makedirs(LOG_DIR, exist_ok=True)
-PTT_LOG_FILE = os.path.join(LOG_DIR, "ptt_asabox.log")
+def get_daily_log_file() -> Path:
+    # 依日期分檔：ptt_asabox_YYYY-MM-DD.log
+    date_str = datetime.date.today().strftime("%Y-%m-%d")
+    return LOG_DIR / f"ptt_asabox_{date_str}.log"
 
 def _ts(ts: float | None = None) -> str:
     ts = ts or time.time()
@@ -40,7 +49,8 @@ def write_ptt_log(start_time: float, status: str, error_message: str | None = No
         msg = " ".join(str(error_message).splitlines())
         line += f"\t{msg}"
     line += "\n"
-    with open(PTT_LOG_FILE, "a", encoding="utf-8") as f:
+    log_file = get_daily_log_file()
+    with open(log_file, "a", encoding="utf-8") as f:
         f.write(line)
 
 def write_dedupe_log(event: str, source: str, detail: str | None = None, ts: float | None = None):
@@ -49,7 +59,31 @@ def write_dedupe_log(event: str, source: str, detail: str | None = None, ts: flo
     if detail:
         line += f"\t{detail}"
     line += "\n"
-    with open(PTT_LOG_FILE, "a", encoding="utf-8") as f:
+    log_file = get_daily_log_file()
+    with open(log_file, "a", encoding="utf-8") as f:
+        f.write(line)
+
+def _ts(ts: float | None = None) -> str:
+    ts = ts or time.time()
+    return datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+
+def write_ptt_log(start_time: float, status: str, error_message: str | None = None):
+    ts_iso = datetime.datetime.fromtimestamp(start_time).strftime("%Y-%m-%d %H:%M:%S")
+    line = f"{ts_iso}\t{status}"
+    if error_message:
+        msg = " ".join(str(error_message).splitlines())
+        line += f"\t{msg}"
+    line += "\n"
+    with open(get_daily_log_file(), "a", encoding="utf-8") as f:
+        f.write(line)
+
+def write_dedupe_log(event: str, source: str, detail: str | None = None, ts: float | None = None):
+    tstr = _ts(ts)
+    line = f"{tstr}\t{event}\t{source}"
+    if detail:
+        line += f"\t{detail}"
+    line += "\n"
+    with open(get_daily_log_file(), "a", encoding="utf-8") as f:
         f.write(line)
 
 # 兩個 Token（必填）
@@ -87,6 +121,14 @@ KEYWORDS_INJURY = [w.strip() for w in os.getenv("KEYWORDS_INJURY", "").split(","
 CONTRACT_PATTERNS = [p.strip() for p in os.getenv("KEYWORDS_CONTRACT_PATTERNS", "").split(";") if p.strip()]
 NEGATIVE_FOR_CONTRACT_TITLE = [w.strip() for w in os.getenv("NEGATIVE_FOR_CONTRACT_TITLE", "").split(",") if w.strip()]
 
+# 從 .env 讀取（注意你的環境變數大小寫）
+YOUTUBE_CHANNEL_ID = os.getenv("Youtube_CHANNEL_ID", "").strip()
+YOUTUBE_API_KEY = os.getenv("Youtube_API_KEY", "").strip()
+DISCORD_WEBHOOK_URL_YT = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
+
+LAST_CHECKED_FILE = BASE_DIR / (os.getenv("LAST_CHECKED_FILE", "last_checked_videos.json"))
+YT_CHECK_INTERVAL_SECONDS = int(os.getenv("YT_CHECK_INTERVAL_SECONDS", "3600"))  # 每小時
+
 # Intents
 intents_bot = discord.Intents.default()
 intents_bot.message_content = True
@@ -119,6 +161,73 @@ TWITTER_URL_PATTERN = re.compile(
     re.IGNORECASE
 )
 
+# 全域簡單去重快取（記憶最近一次寫入的 key 與時間）
+_LOG_DEDUPE_CACHE = {}
+_LOG_LOCK = threading.Lock()
+
+def _ensure_dir(path: str):
+    try:
+        os.makedirs(path, exist_ok=True)
+    except Exception:
+        pass
+
+def _now_ts_str():
+    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+def _default_log_path():
+    base = os.path.join(os.getcwd(), "logs", "yt")
+    _ensure_dir(base)
+    fname = datetime.datetime.now().strftime("%Y-%m-%d") + ".log"
+    return os.path.join(base, fname)
+
+def log_event(tag: str, source: str, message: str, *,
+              level: str = "INFO",
+              file_path: str | None = None,
+              dedupe_key: str | None = None,
+              dedupe_ttl_sec: int = 30,
+              also_print: bool = True):
+    """
+    通用事件記錄：
+    - tag: 事件類型（例如 YT_MONITOR_START, YT_NO_NEW, YT_HTTP_ERROR）
+    - source: 來源系統（例如 'YouTube'）
+    - message: 文字內容（建議含可變資訊：id/url/秒數）
+    - level: INFO/WARN/ERROR
+    - file_path: 指定要寫入的檔案路徑；不指定則使用預設 logs/yt/YYYY-MM-DD.log
+    - dedupe_key: 用於去重的鍵；相同鍵於 TTL 內只寫一次，避免洗版
+    - dedupe_ttl_sec: 去重 TTL 秒數（預設 30 秒）
+    - also_print: 同步印到 console
+    """
+    ts = _now_ts_str()
+    line = f"{ts}\t{level}\t{tag}\t{source}\t{message}"
+
+    # 去重判斷
+    if dedupe_key:
+        with _LOG_LOCK:
+            last_when = _LOG_DEDUPE_CACHE.get(dedupe_key)
+            now_epoch = time.time()
+            if last_when and (now_epoch - last_when) < dedupe_ttl_sec:
+                return
+            _LOG_DEDUPE_CACHE[dedupe_key] = now_epoch
+
+    # 寫檔
+    path = file_path or _default_log_path()
+    try:
+        _ensure_dir(os.path.dirname(path))
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception as e:
+        if also_print:
+            print(f"[LOG] write failed: {e} path={path}")
+
+    # console
+    if also_print:
+        print(f"[LOG] {line}")
+
+def yt_log(tag: str, message: str, *, level: str = "INFO",
+           dedupe_key: str | None = None, dedupe_ttl_sec: int = 30):
+    log_event(tag=tag, source="YouTube", message=message,
+              level=level, dedupe_key=dedupe_key, dedupe_ttl_sec=dedupe_ttl_sec)
+    
 def to_kkinstagram_clean(url: str) -> str | None:
     m = INSTAGRAM_URL_PATTERN.search(url)
     if not m:
@@ -138,6 +247,82 @@ def to_fxtwitter_clean(url: str) -> str | None:
     elif twid:
         return f"https://fxtwitter.com/i/web/status/{twid}"
     return None
+
+def _seconds_until_next_1505(now: datetime.datetime | None = None) -> int:
+    now = now or datetime.datetime.now()
+    target_today = now.replace(hour=15, minute=5, second=0, microsecond=0)
+    target = target_today if now <= target_today else (target_today + datetime.timedelta(days=1))
+    return max(1, int((target - now).total_seconds()))
+
+def _yt_build_service():
+    if not YOUTUBE_API_KEY:
+        raise RuntimeError(f"Missing Youtube_API_KEY in .env at {ENV_PATH}")
+    return build('youtube', 'v3', developerKey=YOUTUBE_API_KEY)
+
+def _yt_get_channel_uploads_playlist_id(youtube, channel_id: str) -> str | None:
+    resp = youtube.channels().list(part="contentDetails", id=channel_id).execute()
+    items = resp.get('items') or []
+    if items:
+        return items[0]['contentDetails']['relatedPlaylists']['uploads']
+    return None
+
+def _yt_get_latest_videos_from_playlist(youtube, playlist_id: str, max_results: int = 10) -> list[dict]:
+    resp = youtube.playlistItems().list(
+        part="snippet,contentDetails",
+        playlistId=playlist_id,
+        maxResults=max_results
+    ).execute()
+    videos = []
+    for item in resp.get('items', []):
+        vid = item['contentDetails']['videoId']
+        title = item['snippet']['title']
+        published_at = item['snippet']['publishedAt']
+        videos.append({"id": vid, "title": title, "publishedAt": published_at, "url": f"https://www.youtube.com/watch?v={vid}"})
+    return videos
+
+def _yt_load_last_checked() -> list[dict]:
+    try:
+        if LAST_CHECKED_FILE.exists():
+            with open(LAST_CHECKED_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return []
+
+def _yt_save_last_checked(videos: list[dict]):
+    try:
+        with open(LAST_CHECKED_FILE, 'w', encoding='utf-8') as f:
+            json.dump(videos, f, ensure_ascii=False, indent=4)
+    except Exception as e:
+        write_ptt_log(time.time(), "YT_SAVE_LAST_CHECKED_FAILED", str(e))
+
+def _yt_send_discord_message(title: str, url: str):
+    if not DISCORD_WEBHOOK_URL_YT:
+        write_ptt_log(time.time(), "YT_WEBHOOK_MISSING", "DISCORD_WEBHOOK_URL not set")
+        return
+    payload = {"content": f"{title}\n{url}"}
+    try:
+        r = requests.post(DISCORD_WEBHOOK_URL_YT, json=payload, timeout=10)
+        if r.status_code not in (200, 204):
+            write_ptt_log(time.time(), "YT_WEBHOOK_FAIL", f"{r.status_code} {r.text}")
+    except Exception as e:
+        write_ptt_log(time.time(), "YT_WEBHOOK_EXCEPTION", str(e))
+
+def _extract_id(item: dict) -> str | None:
+    # 你的 items 來自 _yt_get_latest_videos_from_playlist，已經有 "id"
+    # 若來源不同時也相容 contentDetails.videoId
+    return item.get("id") or item.get("contentDetails", {}).get("videoId")
+
+def _parse_ts(ts: str | None) -> float:
+    if not ts:
+        return 0.0
+    try:
+        return datetime.datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return 0.0
+
+def _sort_by_published(items: list[dict]) -> list[dict]:
+    return sorted(items, key=lambda it: _parse_ts(it.get("publishedAt") or it.get("snippet", {}).get("publishedAt")))
 
 # ===== 媒體限定監控規則（AsaBot 用）=====
 IMG_EXT = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
@@ -542,6 +727,109 @@ class AsaBot(discord.Client):
         except Exception as e:
             print(f"[ERROR-AsaBot] on_message: {e}")
 
+# ========== 你的 YouTube 監控迴圈（已加完整 LOG） ==========
+async def youtube_monitor_loop():
+    print("[YT] monitor starting...")
+    yt_log("YT_MONITOR_START", f"channel={YOUTUBE_CHANNEL_ID}")
+
+    if not YOUTUBE_CHANNEL_ID:
+        print("[YT] YOUTUBE_CHANNEL_ID missing, return")
+        yt_log("YT_CONFIG_MISSING", "YOUTUBE_CHANNEL_ID missing", level="ERROR")
+        return
+
+    try:
+        youtube = _yt_build_service()
+        print("[YT] service built")
+        yt_log("YT_SERVICE_BUILT", "ok")
+    except Exception as e:
+        print(f"[YT] build service failed: {e}")
+        yt_log("YT_SERVICE_BUILD_FAIL", str(e), level="ERROR")
+        return
+
+    uploads_playlist_id = _yt_get_channel_uploads_playlist_id(youtube, YOUTUBE_CHANNEL_ID)
+    if not uploads_playlist_id:
+        msg = f"channel={YOUTUBE_CHANNEL_ID}"
+        print(f"[YT] uploads playlist not found for {msg}, return")
+        yt_log("YT_PLAYLIST_NOT_FOUND", msg, level="ERROR")
+        return
+
+    print(f"[YT] monitoring uploads playlist: {uploads_playlist_id}")
+    yt_log("YT_PLAYLIST_OK", uploads_playlist_id)
+
+    while True:
+        print("[YT] poll begin")
+        yt_log("YT_POLL_BEGIN", _now_ts_str(), dedupe_key="YT_POLL_BEGIN", dedupe_ttl_sec=5)
+        try:
+            items = _yt_get_latest_videos_from_playlist(youtube, uploads_playlist_id, max_results=10)
+            count_msg = f"count={len(items)}"
+            print(f"[YT] fetched={len(items)}")
+            yt_log("YT_FETCHED", count_msg, dedupe_key="YT_FETCHED", dedupe_ttl_sec=10)
+
+            
+            # 2) 載入舊資料
+            last = _yt_load_last_checked()
+            last_ids = {_extract_id(it) for it in last if _extract_id(it)}
+            # 4) 找出新影片
+            new_items = [it for it in items if _extract_id(it) not in last_ids]
+
+            if not new_items:
+                yt_log("YT_NO_NEW", f"ts={_now_ts_str()}", dedupe_key="YT_NO_NEW", dedupe_ttl_sec=30)
+                # 也可選擇仍然覆蓋一次，以保持檔案為最新 10
+                _yt_save_last_checked(items)
+                return
+            
+            # 5) 依時間由舊到新發送，避免逆序
+            for it in _sort_by_published(new_items):
+                vid = _extract_id(it)
+                title = it.get("title") or it.get("snippet", {}).get("title") or "(no title)"
+                url = it.get("url") or (f"https://www.youtube.com/watch?v={vid}" if vid else "")
+                _yt_send_discord_message(title, url)
+                yt_log("YT_NOTIFY_OK", f"{vid} {title}", dedupe_key=f"YT_NOTIFY_OK_{vid}", dedupe_ttl_sec=300)
+            
+            # 6) 覆蓋保存為目前抓到的 10 部
+            _yt_save_last_checked(items)
+            yt_log("YT_SAVED", f"count={len(items)}", dedupe_key="YT_SAVED", dedupe_ttl_sec=30)
+
+            sleep_msg = f"{YT_CHECK_INTERVAL_SECONDS}s"
+            print(f"[YT] sleep {sleep_msg}")
+            yt_log("YT_SLEEP", sleep_msg, dedupe_key="YT_SLEEP", dedupe_ttl_sec=10)
+            await asyncio.sleep(YT_CHECK_INTERVAL_SECONDS)
+
+        except HttpError as e:
+            emsg = str(e)
+            print(f"[YT] HttpError: {emsg}")
+            yt_log("YT_HTTP_ERROR", emsg, level="ERROR", dedupe_key="YT_HTTP_ERROR", dedupe_ttl_sec=60)
+
+            # 判斷是否 quotaExceeded
+            reason = "quotaExceeded" if "quotaExceeded" in emsg else None
+            if reason == "quotaExceeded":
+                sec = _seconds_until_next_1505()
+                wake_dt = datetime.datetime.now() + datetime.timedelta(seconds=sec)
+                wake_str = wake_dt.strftime('%Y-%m-%d %H:%M:%S')
+                print(f"[YT] quotaExceeded -> sleep {sec}s until {wake_str}")
+                yt_log("YT_PAUSE_UNTIL_15_05", f"sleep={sec}s wake={wake_str}")
+                await asyncio.sleep(sec)
+                try:
+                    youtube = _yt_build_service()
+                    uploads_playlist_id = _yt_get_channel_uploads_playlist_id(youtube, YOUTUBE_CHANNEL_ID) or uploads_playlist_id
+                    print("[YT] service rebuilt after quota sleep")
+                    yt_log("YT_REBUILT", "after quota sleep")
+                except Exception as re:
+                    remsg = str(re)
+                    print(f"[YT] rebuild failed: {re}, retry in 60s")
+                    yt_log("YT_REBUILD_FAIL", remsg, level="ERROR")
+                    await asyncio.sleep(60)
+            else:
+                print("[YT] HttpError non-quota, backoff 120s")
+                yt_log("YT_BACKOFF_120S", "HTTP non-quota")
+                await asyncio.sleep(120)
+
+        except Exception as e:
+            emsg = str(e)
+            print(f"[YT] unexpected error: {emsg}, backoff 120s")
+            yt_log("YT_MONITOR_EXCEPTION", emsg, level="ERROR", dedupe_key="YT_MONITOR_EXCEPTION", dedupe_ttl_sec=60)
+            await asyncio.sleep(120)
+
 # ===== AsaBox：PTT 抓取推送（含錨點 + 日誌 + 自動去重，含日誌）=====
 class AsaBox(discord.Client):
     def __init__(self, *args, **kwargs):
@@ -644,13 +932,36 @@ class AsaBox(discord.Client):
                 self.is_fetching = False
                 await asyncio.sleep(FETCH_INTERVAL)
 
+async def run_bot_with_retry(client, token: str, name: str, retry_delay: int = 30):
+    while True:
+        try:
+            await client.start(token)
+        except Exception as e:
+            # 記錄錯誤但不退出，稍後重試
+            print(f"[{name}] error: {e}, retry in {retry_delay}s")
+            write_ptt_log(time.time(), f"{name}_ERROR", str(e))
+            await asyncio.sleep(retry_delay)
+
 async def main():
+
     client_bot = AsaBot(intents=intents_bot)
     client_box = AsaBox(intents=intents_box)
-    await asyncio.gather(
-        client_bot.start(TOKEN_ASA_BOT),
-        client_box.start(TOKEN_ASA_BOX),
-    )
+
+    # 分別包裝兩個 bot 的自動重試
+    bot_task = asyncio.create_task(run_bot_with_retry(client_bot, TOKEN_ASA_BOT, "ASA_BOT"))
+    box_task = asyncio.create_task(run_bot_with_retry(client_box, TOKEN_ASA_BOX, "ASA_BOX"))
+
+    # 啟動 YouTube 監控（內部已處理 quotaExceeded 到 15:05 暫停，不會拋出讓主程式退出）
+    yt_task = asyncio.create_task(youtube_monitor_loop())
+
+    # 使用 gather 並允許回傳例外，不要因單一任務錯誤結束主程式
+    results = await asyncio.gather(bot_task, box_task, yt_task, return_exceptions=True)
+
+    # 如有例外，記錄但不退出（理論上 run_bot_with_retry 是無限迴圈不會返回）
+    for i, res in enumerate(results, start=1):
+        if isinstance(res, Exception):
+            print(f"[MAIN] task {i} error: {res}")
+            write_ptt_log(time.time(), "MAIN_TASK_ERROR", str(res))
 
 if __name__ == "__main__":
     asyncio.run(main())
