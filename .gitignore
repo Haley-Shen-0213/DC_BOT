@@ -121,3 +121,6 @@ scripts/local_*.sh
 .DS_Store
 Thumbs.db
 desktop.ini
+
+Asa.ico
+*.spec
