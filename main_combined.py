@@ -103,6 +103,13 @@ CHANNEL_INTELLIGENCE_NEWS = os.getenv("CHANNEL_INTELLIGENCE_NEWS") or os.getenv(
 CHANNEL_INS  = os.getenv("CHANNEL_INS")  or os.getenv("Channel_INS")
 CHANNEL_TEST = os.getenv("CHANNEL_TEST") or os.getenv("Channel_Test")
 
+# TB（basketballTW）看板與隊伍頻道 IDs
+TB_PTT_URL = os.getenv("TB_PTT_URL", "https://www.ptt.cc/bbs/basketballTW/index.html")
+
+CHANNEL_BRAVES   = int(os.getenv("CHANNEL_BRAVES", "0") or 0)     # P+台北富邦勇士
+CHANNEL_PILOTS   = int(os.getenv("CHANNEL_PILOTS", "0") or 0)     # P+桃園璞園領航猿
+CHANNEL_TSG      = int(os.getenv("CHANNEL_TSG", "0") or 0)        # P+台鋼獵鷹
+CHANNEL_YKE_ARK  = int(os.getenv("CHANNEL_YKE_ARK", "0") or 0)    # P+新竹洋基工程
 # ===== 有效媒體目標頻道集合 =====
 TARGET_MEDIA_CHANNELS = {CHANNEL_SHARING_GIRL, CHANNEL_SHARING_BOY} - {0}
 
@@ -1088,6 +1095,99 @@ def build_content_info(full_date: str, info_type: str, title_no_prefix: str, url
     label = label_map.get(info_type, "情報")
     return f"{full_date}\n[{label}] {title_no_prefix}\n{url}"
 
+# ===== TB（basketballTW）工具 =====
+TB_BASE_URL = "https://www.ptt.cc"
+TB_TARGET_PREFIXES = {"情報", "乳摸", "新聞", "專欄"}  # 僅抓這四種前綴
+
+TEAM_KEYWORDS = {
+    "BRAVES": ["富邦", "勇士"],
+    "PILOTS": ["璞園", "領航猿"],
+    "TSG": ["台鋼", "獵鷹"],
+    "YKE_ARK": ["洋基"],
+}
+
+def is_ptt_tb_url(u: str) -> bool:
+    return isinstance(u, str) and u.startswith("https://www.ptt.cc/bbs/basketballTW/")
+
+def parse_entries_tb(html: str, today: datetime.date):
+    soup = BeautifulSoup(html, "html.parser")
+    rlist = soup.select("div.r-list-container div.r-ent")
+    results = []
+    for ent in rlist:
+        title_div = ent.select_one("div.title")
+        date_div = ent.select_one("div.meta > div.date")
+        if not title_div or not date_div:
+            continue
+        a = title_div.find("a")
+        if not a:
+            continue
+        title_text = a.get_text(strip=True)
+        prefix, remaining_title = extract_bracket_prefix(title_text)
+        href = a.get("href")
+        full_url = urljoin(TB_BASE_URL, href) if href else None
+        date_text = date_div.get_text(strip=True)
+        full_date = ptt_date_to_full_date(date_text, today)
+        results.append({
+            "title": title_text,
+            "title_no_prefix": remaining_title,
+            "prefix": prefix,
+            "ptt_mmdd": date_text,
+            "full_date": full_date,
+            "url": full_url
+        })
+    return results
+
+def find_prev_page_url_tb(html: str):
+    soup = BeautifulSoup(html, "html.parser")
+    paging = soup.select_one("div.btn-group-paging")
+    if not paging:
+        return None
+    for a in paging.select("a.btn.wide[href]"):
+        text = a.get_text(strip=True)
+        href = a["href"]
+        if "上頁" in text and "index" in href and href.endswith(".html"):
+            return urljoin(TB_BASE_URL, href)
+    return None
+
+def filter_by_target_prefix_tb(items):
+    return [it for it in items if (it.get("prefix") or "") in TB_TARGET_PREFIXES]
+
+def match_team_key(title: str) -> str | None:
+    t = title or ""
+    for key, words in TEAM_KEYWORDS.items():
+        for w in words:
+            if w in t:
+                return key
+    return None
+
+def collect_today_tb(session):
+    today = datetime.date.today()
+    today_str = today.strftime("%Y/%m/%d")
+    current_url = TB_PTT_URL
+    pages = 0
+    items = []
+
+    while current_url and pages < MAX_PAGES:
+        html = fetch_page(session, current_url)
+        entries = parse_entries_tb(html, today=today)
+
+        entries_today = [e for e in entries if e.get("full_date") == today_str]
+        entries_today = filter_by_target_prefix_tb(entries_today)
+
+        for i, e in enumerate(entries_today, start=1):
+            write_ptt_log(time.time(), f"[TB][RAW] page={pages+1} idx={i}, date={e.get('full_date')} mmdd={e.get('ptt_mmdd')}, prefix={e.get('prefix')}, title={e.get('title')}, title_no_prefix={e.get('title_no_prefix')}, url={e.get('url')}", None)
+
+        items.extend(entries_today)
+
+        prev_url = find_prev_page_url_tb(html)
+        if not prev_url:
+            break
+        # 若需要「遇到第一則非今日就停」，可在這裡加入 STOP_AT_FIRST_OLDER 判斷
+        current_url = prev_url
+        pages += 1
+
+    return items
+
 # --- PTT：收集今日文章（分類） ---
 def collect_today(session):
     # 以 PTT 索引頁為起點，回溯最多 MAX_PAGES 頁，收集「今日」且符合目標前綴的文章：
@@ -1227,6 +1327,8 @@ class AsaBox(discord.Client):
 
         # 旗標：目前是否正在抓取（True 抓取中；False 待機中）
         self.is_fetching: bool = False
+
+        self.sent_urls = set()
 
         # 啟動日誌：便於在系統層面追蹤 AsaBox 啟動事件
         write_ptt_log(self.started_at, "[PTT-AsaBox] start", None)
@@ -1439,10 +1541,6 @@ class AsaBox(discord.Client):
                         else:
                             await channel.send(p)
 
-                    # 標記這批項目為已送出錨點，
-                    # 供下次增量推送使用
-                    self.anchor_mgr.mark_sent(key, to_send)
-
                 # 一輪抓取與推送完成，
                 # 控制台提示與日誌記錄
                 print("[PTT-AsaBox] one round done (anchor-aware)")
@@ -1462,6 +1560,84 @@ class AsaBox(discord.Client):
 
                 # 控制台輸出去重結果
                 print(f"[PTT-AsaBox] auto dedupe done. total_deleted={total_deleted}")
+                
+                # ========== TB 看板（basketballTW）抓取與推送 ==========
+                tb_items = await asyncio.to_thread(collect_today_tb, session)
+
+                team_channel_map = {
+                    "BRAVES": CHANNEL_BRAVES,
+                    "PILOTS": CHANNEL_PILOTS,
+                    "TSG": CHANNEL_TSG,
+                    "YKE_ARK": CHANNEL_YKE_ARK,
+                }
+
+                team_buckets: dict[str, list] = {k: [] for k in team_channel_map.keys()}
+                others: list = []
+
+                for e in tb_items:
+                    team_key = match_team_key(e.get("title_no_prefix") or e.get("title") or "")
+                    if team_key and team_key in team_buckets:
+                        team_buckets[team_key].append(e)
+                    else:
+                        others.append(e)
+
+                # 將無隊名關鍵字項目寫入每日檔案
+                if others:
+                    day_str = datetime.date.today().strftime("%Y-%m-%d")
+                    out_path = LOG_DIR / f"basketballTW_log_{day_str}.log"
+                    try:
+                        with open(out_path, "a", encoding="utf-8") as f:
+                            for e in others:
+                                d = e.get("full_date","")
+                                t = e.get("title_no_prefix") or e.get("title") or ""
+                                u = e.get("url","")
+                                f.write(f"{d}\t{t}\t{u}\n")
+                        print(f"[TB] others logged: {len(others)} -> {out_path}")
+                    except Exception as e:
+                        print(f"[TB] write others log failed: {e}")
+
+                # 逐隊推送（含歷史 URL 去重 + 同輪保險）
+                for team_key, ch_id in team_channel_map.items():
+                    if not ch_id:
+                        continue
+
+                    channel = self.get_channel(ch_id)
+                    if not channel:
+                        try:
+                            channel = await self.fetch_channel(ch_id)
+                        except Exception as e:
+                            print(f"[WARN] TB Channel not accessible: {ch_id} err={e}")
+                            write_ptt_log(self.started_at, f"[WARN] TB Channel not accessible: {ch_id} err={e}", None)
+                            continue
+
+                    seen_urls = await collect_seen_ptt_urls_from_channel(channel, limit=20)
+
+                    if hasattr(self, "sent_urls") and isinstance(self.sent_urls, set):
+                        # 只保留 TB 基底的同輪 URL
+                        seen_urls |= {u for u in self.sent_urls if is_ptt_tb_url(u)}
+
+                    to_send = []
+                    for e in team_buckets.get(team_key, []):
+                        u = e.get("url")
+                        if not u or not is_ptt_tb_url(u):
+                            continue
+                        if u in seen_urls:
+                            continue
+                        to_send.append(e)
+
+                    print(f"[TB] team={team_key} ch_id={ch_id} to_send={len(to_send)}")
+
+                    for e in to_send:
+                        d = e.get("full_date","")
+                        t = e.get("title_no_prefix") or e.get("title") or ""
+                        u = e.get("url","")
+                        msg = f"{d}\n[{e.get('prefix','')}] {t}\n{u}"
+                        if len(msg) > 1900:
+                            msg = msg[:1900] + "\n(內容過長已截斷)"
+                        await channel.send(msg)
+
+                        if hasattr(self, "sent_urls") and isinstance(self.sent_urls, set) and u:
+                            self.sent_urls.add(u)
 
             except Exception as e:
                 # 抓取迴圈內未預期錯誤，
