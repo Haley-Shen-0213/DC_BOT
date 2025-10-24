@@ -28,6 +28,9 @@ def get_base_dir() -> Path:
 BASE_DIR = get_base_dir()  # 專案根目錄（動態決定，支援打包與原始執行）
 ENV_PATH = BASE_DIR / ".env"  # .env 檔路徑（可自訂位置）
 
+PTT_BASE = "https://www.ptt.cc/bbs/NBA/"
+URL_RE = re.compile(r'https?://\S+')
+
 # 明確載入 .env（若不存在也不報錯；override=False 表示保留現有環境變數）
 load_dotenv(dotenv_path=str(ENV_PATH), override=False)
 
@@ -557,6 +560,10 @@ def collect_today(session):
         entries_today = [e for e in entries if e.get("full_date") == today_str]
         entries_today = filter_by_target_prefix(entries_today, TARGET_PREFIXES)
 
+        # [新增] 印出本頁每一筆抓到的原始條目（過濾後）
+        for i, e in enumerate(entries_today, start=1):
+            write_ptt_log(time.time(), f"[PTT][RAW] page={pages+1} idx={i}, date={e.get('full_date')} mmdd={e.get('ptt_mmdd')}, prefix={e.get('prefix')}, title={e.get('title')}, title_no_prefix={e.get('title_no_prefix')}, url={e.get('url')}", None)
+
         # 分桶：BOX 與 情報（情報需再分類為合約/傷病/其他）
         for e in entries_today:
             if e.get("prefix") == "BOX":
@@ -571,8 +578,69 @@ def collect_today(session):
             break  # 沒有上一頁或結構變動：停止
         current_url = prev_url
         pages += 1
+    write_ptt_log(time.time(), buckets, None)
 
     return buckets  # 回傳分類後的今日文章集合
+
+def normalize_url(u: str) -> str:
+    # 去除末尾常見標點/括號
+    return u.rstrip(').,;!?>"]\'')
+
+def is_ptt_nba_url(u: str) -> bool:
+    return isinstance(u, str) and u.startswith(PTT_BASE)
+
+def extract_urls_from_message(msg) -> set:
+    urls = set()
+
+    # 文字內容
+    content = getattr(msg, "content", None)
+    if content:
+        for m in URL_RE.findall(content):
+            u = normalize_url(m)
+            if is_ptt_nba_url(u):
+                urls.add(u)
+
+    # embeds
+    embeds = getattr(msg, "embeds", None)
+    if embeds:
+        for emb in embeds:
+            # 直接 URL 欄位
+            if getattr(emb, "url", None):
+                u = normalize_url(emb.url)
+                if is_ptt_nba_url(u):
+                    urls.add(u)
+            # 圖片/縮圖的 URL
+            thumb = getattr(emb, "thumbnail", None)
+            if thumb and getattr(thumb, "url", None):
+                u = normalize_url(thumb.url)
+                if is_ptt_nba_url(u):
+                    urls.add(u)
+            image = getattr(emb, "image", None)
+            if image and getattr(image, "url", None):
+                u = normalize_url(image.url)
+                if is_ptt_nba_url(u):
+                    urls.add(u)
+            # 也可掃 emb.description/fields 文字（視需求再加）
+
+    # 附件
+    attachments = getattr(msg, "attachments", None)
+    if attachments:
+        for att in attachments:
+            if getattr(att, "url", None):
+                u = normalize_url(att.url)
+                if is_ptt_nba_url(u):
+                    urls.add(u)
+
+    return urls
+
+async def collect_seen_ptt_urls_from_channel(channel, limit: int = 20) -> set:
+    seen = set()
+    try:
+        async for msg in channel.history(limit=limit):
+            seen |= extract_urls_from_message(msg)
+    except Exception as e:
+        print(f"[WARN] fetch history failed ch={getattr(channel,'id',None)} err={e}")
+    return seen
 
 # ===== 頻道錨點與去重管理（AsaBox 用）=====
 ANCHOR_URL_REGEX = re.compile(r'https?://[^\s]+', re.IGNORECASE)  # 抓取訊息中第一個 URL（直到空白）
@@ -626,13 +694,16 @@ class ChannelAnchorManager:
         # - 若項目 URL 已在 sent_urls 也跳過（避免重發）
         # - 回傳需「新發送」的 items（保持原順序）
         rec = self.map.get(key)
+        print(f"rec = {rec}")
         if not rec:
             return []
         anchor = rec.get("last_url")
+        print(f"anchor = {anchor}")
         if not items:
             return []
         collected = []
         for it in items:
+            print(f"items = {items}, it = {it}")
             u = it.get("url")
             if not u:
                 continue
@@ -734,11 +805,6 @@ async def delete_duplicate_messages(
 
                 # 在 verbose 模式下，記錄基礎掃描狀態（訊息類型、是否有文字內容）
                 if verbose and per_msg_logged < verbose_cap_per_channel:
-                    write_dedupe_log(
-                        "dedupe_msg_scan",              # 逐則掃描事件
-                        source,
-                        detail=f"channel={ch_id} msg_id={msg.id} type={msg.type} has_content={'YES' if (msg.content or '').strip() else 'NO'}"
-                    )
                     per_msg_logged += 1
 
                 # 抽取並標準化文字內容：去除前後空白，None 轉空字串
@@ -747,22 +813,12 @@ async def delete_duplicate_messages(
                 # 若沒有文字內容（例如只有附件或嵌入），不納入去重，直接略過
                 if not content:
                     if verbose and per_msg_logged < verbose_cap_per_channel:
-                        write_dedupe_log(
-                            "dedupe_msg_skip",
-                            source,
-                            detail=f"channel={ch_id} msg_id={msg.id} reason=empty_or_embed_only"
-                        )
                         per_msg_logged += 1
                     continue
 
                 # 只處理「一般訊息」；系統訊息、pin、thread 事件等型別一律略過
                 if msg.type != discord.MessageType.default:
                     if verbose and per_msg_logged < verbose_cap_per_channel:
-                        write_dedupe_log(
-                            "dedupe_msg_skip",
-                            source,
-                            detail=f"channel={ch_id} msg_id={msg.id} reason=non_default_type({msg.type})"
-                        )
                         per_msg_logged += 1
                     continue
 
@@ -806,11 +862,6 @@ async def delete_duplicate_messages(
                     # 第一次看到此內容：加入 seen，視為保留的原始訊息
                     seen.add(key)
                     if verbose and per_msg_logged < verbose_cap_per_channel:
-                        write_dedupe_log(
-                            "dedupe_msg_seen",
-                            source,
-                            detail=f"channel={ch_id} msg_id={msg.id} status=kept_as_original"
-                        )
                         per_msg_logged += 1
 
             # 每頻道掃描完成：印出控制台摘要
@@ -1317,7 +1368,6 @@ class AsaBox(discord.Client):
                 # 以執行緒跑 collect_today(session)，
                 # 避免阻塞事件迴圈（I/O 或 CPU 操作）
                 buckets = await asyncio.to_thread(collect_today, session)
-
                 # 分類到頻道的映射，
                 # 將不同內容分類對應到不同頻道
                 mapping = {
@@ -1350,13 +1400,33 @@ class AsaBox(discord.Client):
                             write_ptt_log(self.started_at, f"[WARN] Channel not accessible: {ch_id} err={e}", None)
                             continue
 
+                    print(f"[PTT] category={key} ch_id={ch_id} buckets_count={len(buckets.get(key, []))}")
+
                     # 從 buckets 取得該分類的今日項目，
                     # 若不存在則為空清單
                     todays_items = buckets.get(key, [])
 
-                    # 依錨點檢查並過濾，
-                    # 遇到已處理錨點即停止，僅保留新項目
-                    to_send = self.anchor_mgr.stop_when_hit_anchor(key, todays_items)
+                    # 拉取該頻道近 20 則訊息，抽取 PTT NBA 基底的 URL
+                    seen_urls = await collect_seen_ptt_urls_from_channel(channel, limit=20)
+
+                    # 同輪保險：若你已有 self.sent_urls 作為去重集合，加入避免同輪重覆
+                    if hasattr(self, "sent_urls") and isinstance(self.sent_urls, set):
+                        seen_urls |= {u for u in self.sent_urls if is_ptt_nba_url(u)}
+
+                    # 過濾：只保留 PTT NBA 基底的 URL，且不在 seen_urls 中
+                    to_send = []
+                    for it in todays_items:
+                        u = it.get("url")
+                        if not u:
+                            continue
+                        if not is_ptt_nba_url(u):
+                            # 非目標基底，略過（避免搜尋過多/跨站）
+                            continue
+                        if u in seen_urls:
+                            continue
+                        to_send.append(it)
+
+                    print(f"[PTT] to_send count for {key}: {len(to_send)}")
 
                     # 新增：記錄本分類即將發送的清單
                     if to_send:
