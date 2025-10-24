@@ -322,7 +322,7 @@ async def delete_duplicate_messages(
     # 全域統計：累加刪除數與掃描數
     total_deleted = 0
     total_scanned = 0
-
+    print(f'channel_ids={channel_ids}')
     # 逐一處理每個頻道 ID
     for ch_id in channel_ids:
         # 若 ch_id 無效（None 或 0），略過
@@ -819,7 +819,8 @@ class AsaBot(discord.Client):
         # 啟動時自動掃描去重的頻道集合（可依需求調整）
         channel_ids = [
             CHANNEL_SHARING_GIRL, CHANNEL_SHARING_BOY, CHANNEL_INJURIED,
-            CHANNEL_GAME_BOX, CHANNEL_CONTRACT, CHANNEL_INTELLIGENCE_NEWS
+            CHANNEL_GAME_BOX, CHANNEL_CONTRACT, CHANNEL_INTELLIGENCE_NEWS,
+            CHANNEL_BRAVES, CHANNEL_PILOTS, CHANNEL_TSG, CHANNEL_YKE_ARK
         ]
         total = await delete_duplicate_messages(self, channel_ids, DUPLICATE_SCAN_LIMIT, source="auto.Asabot")
         print(f"[DEDUPE] finished on start. total_deleted={total}")
@@ -932,7 +933,7 @@ class AsaBot(discord.Client):
 # --- PTT 設定 ---
 # PTT 設定（AsaBox 使用）
 BASE_URL = "https://www.ptt.cc"  # PTT 主站域名（用於拼接相對連結）
-INDEX_URL = os.getenv("NBA_PTT_URL", "https://www.ptt.cc/bbs/NBA/index.html")  # 看板索引頁 URL
+INDEX_URL = os.getenv("NBA_PTT_URL", "https://www.ptt.cc/bbs/NBA/")  # 看板索引頁 URL
 FETCH_INTERVAL = int(os.getenv("PTT_FETCH_INTERVAL_SEC", "900"))  # 抓取週期（秒）
 MAX_PAGES = int(os.getenv("PTT_MAX_PAGES", "12"))  # 最大索引頁數回溯
 ONLY_TODAY = os.getenv("PTT_ONLY_TODAY", "true").lower() == "true"  # 僅抓取今日文章
@@ -1107,7 +1108,7 @@ TEAM_KEYWORDS = {
 }
 
 def is_ptt_tb_url(u: str) -> bool:
-    return isinstance(u, str) and u.startswith("https://www.ptt.cc/bbs/basketballTW/")
+    return isinstance(u, str) and u.startswith(TB_BASE_URL)
 
 def parse_entries_tb(html: str, today: datetime.date):
     soup = BeautifulSoup(html, "html.parser")
@@ -1258,6 +1259,8 @@ def extract_urls_from_message(msg) -> set:
             u = normalize_url(m)
             if is_ptt_nba_url(u):
                 urls.add(u)
+            if is_ptt_tb_url(u):
+                urls.add(u)
 
     # embeds
     embeds = getattr(msg, "embeds", None)
@@ -1268,16 +1271,22 @@ def extract_urls_from_message(msg) -> set:
                 u = normalize_url(emb.url)
                 if is_ptt_nba_url(u):
                     urls.add(u)
+                if is_ptt_tb_url(u):
+                    urls.add(u)
             # 圖片/縮圖的 URL
             thumb = getattr(emb, "thumbnail", None)
             if thumb and getattr(thumb, "url", None):
                 u = normalize_url(thumb.url)
                 if is_ptt_nba_url(u):
                     urls.add(u)
+                if is_ptt_tb_url(u):
+                    urls.add(u)
             image = getattr(emb, "image", None)
             if image and getattr(image, "url", None):
                 u = normalize_url(image.url)
                 if is_ptt_nba_url(u):
+                    urls.add(u)
+                if is_ptt_tb_url(u):
                     urls.add(u)
             # 也可掃 emb.description/fields 文字（視需求再加）
 
@@ -1288,6 +1297,8 @@ def extract_urls_from_message(msg) -> set:
             if getattr(att, "url", None):
                 u = normalize_url(att.url)
                 if is_ptt_nba_url(u):
+                    urls.add(u)
+                if is_ptt_tb_url(u):
                     urls.add(u)
 
     return urls
@@ -1411,9 +1422,9 @@ class AsaBox(discord.Client):
         # 用於刪除重覆訊息
         target_channels_for_dedupe = [
             CHANNEL_SHARING_GIRL, CHANNEL_SHARING_BOY, CHANNEL_INJURIED,
-            CHANNEL_GAME_BOX, CHANNEL_CONTRACT, CHANNEL_INTELLIGENCE_NEWS, CHANNEL_INS 
+            CHANNEL_GAME_BOX, CHANNEL_CONTRACT, CHANNEL_INTELLIGENCE_NEWS,
+            CHANNEL_BRAVES, CHANNEL_PILOTS, CHANNEL_TSG, CHANNEL_YKE_ARK
         ]
-
         # 主抓取迴圈，
         # 以固定週期執行一輪抓取與推送
         while True:
@@ -1549,17 +1560,6 @@ class AsaBox(discord.Client):
                 # 更新「上次完成時間」
                 self.last_round_completed_at = time.time()
                 print(f"target_channels_for_dedupe={target_channels_for_dedupe}")
-                # 自動去重，
-                # 掃描指定頻道刪除重覆訊息（依 source tag）
-                total_deleted = await delete_duplicate_messages(
-                    self,
-                    target_channels_for_dedupe,
-                    DUPLICATE_SCAN_LIMIT,
-                    source="auto.Asabox",
-                )
-
-                # 控制台輸出去重結果
-                print(f"[PTT-AsaBox] auto dedupe done. total_deleted={total_deleted}")
                 
                 # ========== TB 看板（basketballTW）抓取與推送 ==========
                 tb_items = await asyncio.to_thread(collect_today_tb, session)
@@ -1638,6 +1638,18 @@ class AsaBox(discord.Client):
 
                         if hasattr(self, "sent_urls") and isinstance(self.sent_urls, set) and u:
                             self.sent_urls.add(u)
+                            
+                # 自動去重，
+                # 掃描指定頻道刪除重覆訊息（依 source tag）
+                total_deleted = await delete_duplicate_messages(
+                    self,
+                    target_channels_for_dedupe,
+                    DUPLICATE_SCAN_LIMIT,
+                    source="auto.Asabox",
+                )
+
+                # 控制台輸出去重結果
+                print(f"[PTT-AsaBox] auto dedupe done. total_deleted={total_deleted}")
 
             except Exception as e:
                 # 抓取迴圈內未預期錯誤，
