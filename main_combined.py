@@ -1,3 +1,7 @@
+# =========================
+# 1) 共用區（設定/工具/日誌/通用去重/跑兩個 Bot 主程式）
+# =========================
+
 import os
 import sys
 import re
@@ -12,12 +16,12 @@ from bs4 import BeautifulSoup
 from urllib.parse import urlparse, urljoin
 from dotenv import load_dotenv
 from pathlib import Path
-# ===== YouTube 監控（新增）=====
 import threading
 import json
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
+# --- 共用：基底路徑 / .env 載入 ---
 def get_base_dir() -> Path:
     # 若是打包為 exe（例如 PyInstaller），使用 exe 所在目錄，
     # 否則以目前腳本所在目錄作為基準（便於相對路徑與資源尋址）
@@ -28,15 +32,13 @@ def get_base_dir() -> Path:
 BASE_DIR = get_base_dir()  # 專案根目錄（動態決定，支援打包與原始執行）
 ENV_PATH = BASE_DIR / ".env"  # .env 檔路徑（可自訂位置）
 
-PTT_BASE = "https://www.ptt.cc/bbs/NBA/"
-URL_RE = re.compile(r'https?://\S+')
-
 # 明確載入 .env（若不存在也不報錯；override=False 表示保留現有環境變數）
 load_dotenv(dotenv_path=str(ENV_PATH), override=False)
 
-# ===== 檔案與日誌設定 =====
+# --- 共用：日誌 ---
 LOG_DIR = BASE_DIR / "log"  # 日誌目錄（每日分檔）
 os.makedirs(LOG_DIR, exist_ok=True)  # 若不存在則建立目錄
+
 def get_daily_log_file() -> Path:
     # 依日期分檔：ptt_asabox_YYYY-MM-DD.log（便於輪替與檢索）
     date_str = datetime.date.today().strftime("%Y-%m-%d")
@@ -71,6 +73,7 @@ def write_dedupe_log(event: str, source: str, detail: str | None = None, ts: flo
     with open(log_file, "a", encoding="utf-8") as f:
         f.write(line)
 
+# --- 共用：環境變數 / Token / 頻道 ---
 # 兩個 Token（必填），
 # 從 .env 或系統環境變數載入；缺少即拋錯提醒設定
 TOKEN_ASA_BOT = os.getenv("TOKEN_ASA_BOT")
@@ -111,26 +114,7 @@ AUTO_DEDUPE_ON_START = os.getenv("AUTO_DEDUPE_ON_START", "false").lower() == "tr
 # 控制 heartbeat 訊息輸出的時間間隔（秒）
 HEARTBEAT_INTERVAL_SEC = int(os.getenv("HEARTBEAT_INTERVAL_SEC", "3600"))
 
-# PTT 設定（AsaBox 使用）
-BASE_URL = "https://www.ptt.cc"  # PTT 主站域名（用於拼接相對連結）
-INDEX_URL = os.getenv("PTT_URL", "https://www.ptt.cc/bbs/NBA/index.html")  # 看板索引頁 URL
-FETCH_INTERVAL = int(os.getenv("PTT_FETCH_INTERVAL_SEC", "900"))  # 抓取週期（秒）
-MAX_PAGES = int(os.getenv("PTT_MAX_PAGES", "12"))  # 最大索引頁數回溯
-ONLY_TODAY = os.getenv("PTT_ONLY_TODAY", "true").lower() == "true"  # 僅抓取今日文章
-STOP_AT_FIRST_OLDER = os.getenv("PTT_STOP_AT_FIRST_OLDER", "true").lower() == "true"  # 遇到非今日即停
-TARGET_PREFIXES = [p.strip() for p in os.getenv("PTT_TARGET_PREFIXES", "BOX,情報").split(",") if p.strip()]  # 目標標題前綴
-KEYWORDS_INJURY = [w.strip() for w in os.getenv("KEYWORDS_INJURY", "").split(",") if w.strip()]  # 傷病關鍵字
-CONTRACT_PATTERNS = [p.strip() for p in os.getenv("KEYWORDS_CONTRACT_PATTERNS", "").split(";") if p.strip()]  # 合約模式（分號分隔）
-NEGATIVE_FOR_CONTRACT_TITLE = [w.strip() for w in os.getenv("NEGATIVE_FOR_CONTRACT_TITLE", "").split(",") if w.strip()]  # 合約負面排除字
-
-# 從 .env 讀取（注意你的環境變數大小寫）
-YOUTUBE_CHANNEL_ID = os.getenv("YOUTUBE_CHANNEL_ID", "").strip()  # 目標 YouTube 頻道 ID
-YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "").strip()        # YouTube Data API 金鑰
-DISCORD_WEBHOOK_URL_YT = os.getenv("DISCORD_WEBHOOK_URL", "").strip()  # 用於推播 YouTube 更新的 Discord Webhook
-
-LAST_CHECKED_FILE = BASE_DIR / (os.getenv("LAST_CHECKED_FILE", "last_checked_videos.json"))  # 已檢查影片記錄檔
-YT_CHECK_INTERVAL_SECONDS = int(os.getenv("YT_CHECK_INTERVAL_SECONDS", "3600"))  # YouTube 檢查週期（秒，預設每小時）
-
+# --- 共用：Discord Intents ---
 # Intents（Discord 權限意圖設定：需與機器人 Portal 設定一致）
 intents_bot = discord.Intents.default()
 intents_bot.message_content = True  # 允許讀取訊息內容（需在 Portal 開啟 Message Content Intent）
@@ -142,6 +126,7 @@ intents_box.message_content = True  # AsaBox 也需要讀取訊息內容
 intents_box.guilds = True
 intents_box.messages = True
 
+# --- 共用：媒體與社群平台正則/工具（AsaBot 用） ---
 # ===== IG / X 連結規則（AsaBot 用）=====
 INSTAGRAM_URL_PATTERN = re.compile(
     # 支援 instagram.com / instagr.am / kkinstagram.com，
@@ -166,7 +151,60 @@ TWITTER_URL_PATTERN = re.compile(
     r'(?:#[^\s)]*)?',    # 可選片段（hash）
     re.IGNORECASE
 )
+# ===== 媒體限定監控規則（AsaBot 用）=====
+IMG_EXT = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}  # 影像副檔名集合
+VID_EXT = {".mp4", ".webm", ".mov", ".mkv", ".avi", ".m4v"}   # 影片副檔名集合
+EMBED_HOSTS = {
+    # 常見可嵌入／社群平台主機（支援尾端比對，例如 subdomain.twitter.com 也會符合）
+    "instagram.com", "instagr.am", "kkinstagram.com",
+    "twitter.com", "x.com", "fxtwitter.com",
+    "youtube.com", "youtu.be",
+    "tiktok.com",
+    "reddit.com", "v.redd.it",
+    "imgur.com", "i.imgur.com",
+    "gfycat.com", "streamable.com",
+}
+URL_PATTERN = re.compile(r'https?://[^\s)]+', re.IGNORECASE)  # 簡單抓取 URL 的正則：空白或右括號前截止
 
+def is_media_url(u: str) -> bool:
+    # 判斷字串是否為「媒體連結」：
+    # 1) 若 path 擁有常見圖片/影片副檔名 -> True
+    # 2) 若主機為常見嵌入社群站台（EMBED_HOSTS） -> True
+    # 任何例外或不匹配 -> False
+    try:
+        p = urlparse(u)  # 解析 URL（scheme/netloc/path/query/fragment）
+        ext = (p.path or "").lower()
+        for e in IMG_EXT | VID_EXT:
+            if ext.endswith(e):
+                return True  # 副檔名直接匹配
+        host = (p.netloc or "").lower()
+        return any(host.endswith(h) for h in EMBED_HOSTS)  # 以尾端比對支援子網域
+    except Exception:
+        return False
+    
+def to_kkinstagram_clean(url: str) -> str | None:
+    # 將原始 Instagram 連結轉為 kkinstagram 乾淨頁面（便於 Discord 嵌入與預覽）
+    m = INSTAGRAM_URL_PATTERN.search(url)
+    if not m:
+        return None
+    path_type = m.group(2)     # p/reel/tv
+    content_id = m.group(3)    # 內容短碼
+    return f"https://www.kkinstagram.com/{path_type}/{content_id}/"
+
+def to_fxtwitter_clean(url: str) -> str | None:
+    # 將原始 Twitter/X 連結轉為 fxtwitter 乾淨頁面（改善預覽與解析）
+    m = TWITTER_URL_PATTERN.search(url)
+    if not m:
+        return None
+    user = m.group('user')     # 使用者帳號
+    twid = m.group('id1') or m.group('id2')  # 推文 ID（兩種欄位其一）
+    if user and twid:
+        return f"https://fxtwitter.com/{user}/status/{twid}"
+    elif twid:
+        return f"https://fxtwitter.com/i/web/status/{twid}"
+    return None  # 無法解析時回傳 None
+
+# --- 共用：通用日誌（YT 用薄包） ---
 # 全域簡單去重快取，
 # 記憶最近一次寫入的 key 與時間，避免短時間重覆處理
 _LOG_DEDUPE_CACHE = {}
@@ -239,495 +277,8 @@ def yt_log(tag: str, message: str, *, level: str = "INFO",
     # YouTube 專用薄包：固定 source="YouTube"，傳入其他參數到 log_event
     log_event(tag=tag, source="YouTube", message=message,
               level=level, dedupe_key=dedupe_key, dedupe_ttl_sec=dedupe_ttl_sec)
-
-def to_kkinstagram_clean(url: str) -> str | None:
-    # 將原始 Instagram 連結轉為 kkinstagram 乾淨頁面（便於 Discord 嵌入與預覽）
-    m = INSTAGRAM_URL_PATTERN.search(url)
-    if not m:
-        return None
-    path_type = m.group(2)     # p/reel/tv
-    content_id = m.group(3)    # 內容短碼
-    return f"https://www.kkinstagram.com/{path_type}/{content_id}/"
-
-def to_fxtwitter_clean(url: str) -> str | None:
-    # 將原始 Twitter/X 連結轉為 fxtwitter 乾淨頁面（改善預覽與解析）
-    m = TWITTER_URL_PATTERN.search(url)
-    if not m:
-        return None
-    user = m.group('user')     # 使用者帳號
-    twid = m.group('id1') or m.group('id2')  # 推文 ID（兩種欄位其一）
-    if user and twid:
-        return f"https://fxtwitter.com/{user}/status/{twid}"
-    elif twid:
-        return f"https://fxtwitter.com/i/web/status/{twid}"
-    return None  # 無法解析時回傳 None
-
-def _seconds_until_next_1505(now: datetime.datetime | None = None) -> int:
-    # 計算距離下一次 15:05 的秒數（最少回傳 1 秒）
-    now = now or datetime.datetime.now()
-    target_today = now.replace(hour=15, minute=5, second=0, microsecond=0)
-    target = target_today if now <= target_today else (target_today + datetime.timedelta(days=1))
-    return max(1, int((target - now).total_seconds()))
-
-def _yt_build_service():
-    # 建立 YouTube Data API v3 的 service 物件；缺金鑰則拋錯，提醒設定 .env
-    if not YOUTUBE_API_KEY:
-        raise RuntimeError(f"Missing Youtube_API_KEY in .env at {ENV_PATH}")
-    return build('youtube', 'v3', developerKey=YOUTUBE_API_KEY)
-
-def _yt_get_channel_uploads_playlist_id(youtube, channel_id: str) -> str | None:
-    # 用 channel_id 取回該頻道的「uploads」播放清單 ID（頻道所有上傳影片）
-    resp = youtube.channels().list(part="contentDetails", id=channel_id).execute()
-    items = resp.get('items') or []
-    if items:
-        return items[0]['contentDetails']['relatedPlaylists']['uploads']  # 取第一筆的 uploads 欄位
-    return None  # 找不到頻道或缺欄位時回傳 None
-
-def _yt_get_latest_videos_from_playlist(youtube, playlist_id: str, max_results: int = 10) -> list[dict]:
-    # 以播放清單 ID 抓取最新影片（回傳字典列表：id/title/publishedAt/url）
-    resp = youtube.playlistItems().list(
-        part="snippet,contentDetails",
-        playlistId=playlist_id,
-        maxResults=max_results
-    ).execute()
-    videos = []
-    for item in resp.get('items', []):
-        vid = item['contentDetails']['videoId']
-        title = item['snippet']['title']
-        published_at = item['snippet']['publishedAt']  # ISO 8601 格式時間
-        videos.append({"id": vid, "title": title, "publishedAt": published_at, "url": f"https://www.youtube.com/watch?v={vid}"})
-    return videos
-
-def _yt_load_last_checked() -> list[dict]:
-    # 載入上次檢查記錄（JSON 檔）：若無或錯誤則回空列表
-    try:
-        if LAST_CHECKED_FILE.exists():
-            with open(LAST_CHECKED_FILE, 'r', encoding='utf-8') as f:
-                return json.load(f)  # 預期為 list[dict]，含 id/title/publishedAt/url
-    except Exception:
-        pass  # 可選：yt_log("YT_LOAD_LAST_CHECKED_FAILED", str(e), level="WARN")
-    return []
-
-def _yt_save_last_checked(videos: list[dict]):
-    # 保存本次檢查的影片列表到 JSON：格式化縮排便於手動檢視
-    try:
-        with open(LAST_CHECKED_FILE, 'w', encoding='utf-8') as f:
-            json.dump(videos, f, ensure_ascii=False, indent=4)
-    except Exception as e:
-        write_ptt_log(time.time(), "YT_SAVE_LAST_CHECKED_FAILED", str(e))  # 失敗記錄於一般日誌
-
-def _yt_send_discord_message(title: str, url: str):
-    # 將新影片通知以 Discord Webhook 推送：content=標題 + URL
-    if not DISCORD_WEBHOOK_URL_YT:
-        write_ptt_log(time.time(), "YT_WEBHOOK_MISSING", "DISCORD_WEBHOOK_URL not set")
-        return
-    payload = {"content": f"{title}\n{url}"}
-    try:
-        r = requests.post(DISCORD_WEBHOOK_URL_YT, json=payload, timeout=10)  # POST JSON，10 秒 timeout
-        if r.status_code not in (200, 204):
-            write_ptt_log(time.time(), "YT_WEBHOOK_FAIL", f"{r.status_code} {r.text}")  # 非成功狀態碼記錄
-    except Exception as e:
-        write_ptt_log(time.time(), "YT_WEBHOOK_EXCEPTION", str(e))  # 例外記錄
-
-def _extract_id(item: dict) -> str | None:
-    # 從影片項目擷取 videoId：
-    # - 你的來源（_yt_get_latest_videos_from_playlist）已含 "id"
-    # - 若來源不同（例如直接用 playlistItems 原生結構），則相容 contentDetails.videoId
-    return item.get("id") or item.get("contentDetails", {}).get("videoId")
-
-def _parse_ts(ts: str | None) -> float:
-    # 將 ISO 8601（含 Z）時間字串轉為 epoch 秒數；解析失敗回傳 0.0
-    # 例：2024-10-01T12:34:56Z -> 轉為 UTC 時區的 timestamp
-    if not ts:
-        return 0.0
-    try:
-        return datetime.datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
-    except Exception:
-        return 0.0  # 解析失敗時給零，方便排序時自然排在最前（或視情況調整）
-
-def _sort_by_published(items: list[dict]) -> list[dict]:
-    # 依發布時間（publishedAt）排序由舊到新：
-    # - 優先讀取 item["publishedAt"]
-    # - 若沒有，嘗試讀取 item["snippet"]["publishedAt"]
-    # - 使用 _parse_ts 將字串轉 timestamp 作為排序 key
-    return sorted(items, key=lambda it: _parse_ts(it.get("publishedAt") or it.get("snippet", {}).get("publishedAt")))
-
-# ===== 媒體限定監控規則（AsaBot 用）=====
-IMG_EXT = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}  # 影像副檔名集合
-VID_EXT = {".mp4", ".webm", ".mov", ".mkv", ".avi", ".m4v"}   # 影片副檔名集合
-EMBED_HOSTS = {
-    # 常見可嵌入／社群平台主機（支援尾端比對，例如 subdomain.twitter.com 也會符合）
-    "instagram.com", "instagr.am", "kkinstagram.com",
-    "twitter.com", "x.com", "fxtwitter.com",
-    "youtube.com", "youtu.be",
-    "tiktok.com",
-    "reddit.com", "v.redd.it",
-    "imgur.com", "i.imgur.com",
-    "gfycat.com", "streamable.com",
-}
-URL_PATTERN = re.compile(r'https?://[^\s)]+', re.IGNORECASE)  # 簡單抓取 URL 的正則：空白或右括號前截止
-
-def is_media_url(u: str) -> bool:
-    # 判斷字串是否為「媒體連結」：
-    # 1) 若 path 擁有常見圖片/影片副檔名 -> True
-    # 2) 若主機為常見嵌入社群站台（EMBED_HOSTS） -> True
-    # 任何例外或不匹配 -> False
-    try:
-        p = urlparse(u)  # 解析 URL（scheme/netloc/path/query/fragment）
-        ext = (p.path or "").lower()
-        for e in IMG_EXT | VID_EXT:
-            if ext.endswith(e):
-                return True  # 副檔名直接匹配
-        host = (p.netloc or "").lower()
-        return any(host.endswith(h) for h in EMBED_HOSTS)  # 以尾端比對支援子網域
-    except Exception:
-        return False
-
-# ===== PTT/NBA 工具（AsaBox 用）=====
-def make_session():
-    # 建立 requests Session，帶入：
-    # - over18=1 cookie（跳過 PTT 年齡確認）
-    # - 自訂 UA（避免被視為爬蟲或取得較穩定結果）
-    s = requests.Session()
-    s.cookies.set('over18', '1', domain='.ptt.cc')
-    s.headers.update({"User-Agent": "Mozilla/5.0 (compatible; PTTFetcher/2.1)"})
-    return s
-
-def fetch_page(session, url):
-    # 以既有 session 取頁面，10 秒逾時；狀態碼非 2xx 時 raise_for_status 拋錯
-    resp = session.get(url, timeout=10)
-    resp.raise_for_status()
-    return resp.text  # 回傳 HTML 文字
-
-def extract_bracket_prefix(title: str):
-    # 解析標題前綴（中括號）：
-    # [BOX] XXX -> 回傳 ("BOX", "XXX")
-    # 規則：
-    # - 以 '[' 開頭且存在 ']'，取中間內容為 prefix（移除空白）
-    # - remaining 為 ']' 之後的標題（去除左側空白）
-    # - 內容空字串時回傳 None 作為 prefix
-    t = title.strip()
-    if len(t) >= 3 and t[0] == '[':
-        close_idx = t.find(']')
-        if close_idx != -1:
-            inner = ''.join(t[1:close_idx].strip().split())  # 去空白與中間空白（確保一致性）
-            remaining = t[close_idx+1:].lstrip()
-            return (inner if inner else None), remaining
-    return None, t  # 無中括號前綴時：prefix=None, remaining=整標題
-
-def ptt_date_to_full_date(mmdd: str, today: datetime.date):
-    # 將 PTT 列表的日期（MM/DD）轉為 "YYYY/MM/DD"：
-    # - 年份取今日年份（PTT 列表不含年）
-    # - 不可解析或數值非法則回傳 None
-    parts = (mmdd or "").strip().split('/')
-    if len(parts) != 2:
-        return None
-    try:
-        m = int(parts[0].strip()); d = int(parts[1].strip())
-        return datetime.date(today.year, m, d).strftime("%Y/%m/%d")
-    except ValueError:
-        return None
-
-def parse_entries(html: str, today: datetime.date):
-    # 解析索引頁 HTML，擷取每筆文章資訊：
-    # - title: 原始標題
-    # - title_no_prefix: 去除中括號前綴後的標題
-    # - prefix: 中括號內前綴（BOX／情報 等）
-    # - ptt_mmdd: PTT 列表顯示的 MM/DD
-    # - full_date: 轉為 "YYYY/MM/DD"（以 today 年份）
-    # - url: 文章完整 URL
-    soup = BeautifulSoup(html, "html.parser")
-    rlist = soup.select("div.r-list-container div.r-ent")  # PTT 列表條目
-    results = []
-    for ent in rlist:
-        title_div = ent.select_one("div.title")
-        date_div = ent.select_one("div.meta > div.date")
-        if not title_div or not date_div:
-            continue  # 結構不完整：略過
-        a = title_div.find("a")
-        if not a:
-            continue  # 例如已刪文或無連結：略過
-        title_text = a.get_text(strip=True)
-        prefix, remaining_title = extract_bracket_prefix(title_text)  # 解析前綴
-        href = a.get("href")
-        full_url = urljoin(BASE_URL, href) if href else None
-        date_text = date_div.get_text(strip=True)
-        full_date = ptt_date_to_full_date(date_text, today)
-        results.append({
-            "title": title_text,
-            "title_no_prefix": remaining_title,
-            "prefix": prefix,
-            "ptt_mmdd": date_text,
-            "full_date": full_date,
-            "url": full_url
-        })
-    return results
-
-def find_prev_page_url(html: str):
-    # 從索引頁 HTML 找到「上頁」連結（上一頁 index.html）：
-    # - 目標選擇器：div.btn-group-paging 內 a.btn.wide[href]
-    # - 文字含「上頁」且 href 包含 "index" 且 .html 結尾
-    soup = BeautifulSoup(html, "html.parser")
-    paging = soup.select_one("div.btn-group-paging")
-    if not paging:
-        return None
-    for a in paging.select("a.btn.wide[href]"):
-        text = a.get_text(strip=True)
-        href = a["href"]
-        if "上頁" in text and "index" in href and href.endswith(".html"):
-            return urljoin(BASE_URL, href)
-    return None  # 找不到則回傳 None
-
-def filter_by_target_prefix(items, target_prefixes):
-    # 依目標前綴過濾項目（空集合時回傳原列表）：
-    # - 只保留 prefix 在 target_prefixes 內的文章
-    if not target_prefixes:
-        return items
-    return [it for it in items if (it.get("prefix") or "") in target_prefixes]
-
-def is_injury(title: str) -> bool:
-    # 判斷是否為「傷病」資訊：
-    # - 將標題轉小寫，檢查是否包含 KEYWORDS_INJURY 任一關鍵字（亦轉小寫）
-    tl = (title or "").lower()
-    return any(kw.lower() in tl for kw in KEYWORDS_INJURY)
-
-def is_contract(title: str) -> bool:
-    # 判斷是否為「合約／交易」資訊：
-    # - 先做負面排除（NEGATIVE_FOR_CONTRACT_TITLE）
-    # - 再以 CONTRACT_PATTERNS（正則）匹配標題（忽略大小寫）
-    t = title or ""
-    tl = t.lower()
-    if any(neg.lower() in tl for neg in NEGATIVE_FOR_CONTRACT_TITLE):
-        return False
-    for pat in CONTRACT_PATTERNS:
-        if re.search(pat, t, flags=re.IGNORECASE):
-            return True
-    return False
-
-def classify_info(title: str) -> str:
-    # 將情報類別分類為三種：
-    # - INFO_INJURIED（傷病）/ INFO_CONTRACT（合約交易）/ INFO_OTHER（其他）
-    if is_injury(title):
-        return "INFO_INJURIED"
-    if is_contract(title):
-        return "INFO_CONTRACT"
-    return "INFO_OTHER"
-
-def build_content_box(full_date: str, title_no_prefix: str, url: str):
-    # 組合 BOX 類訊息內容（便於推播到 Discord）
-    # 格式：
-    # YYYY/MM/DD
-    # [BOX] <去前綴標題>
-    # <文章 URL>
-    return f"{full_date}\n[BOX] {title_no_prefix}\n{url}"
-
-def build_content_info(full_date: str, info_type: str, title_no_prefix: str, url: str):
-    # 組合 情報 類訊息內容，依 info_type 映射中文標籤
-    label_map = {
-        "INFO_CONTRACT": "情報-合約/交易",
-        "INFO_INJURIED": "情報-受傷",
-        "INFO_OTHER": "情報-其他",
-    }
-    label = label_map.get(info_type, "情報")
-    return f"{full_date}\n[{label}] {title_no_prefix}\n{url}"
-
-def collect_today(session):
-    # 以 PTT 索引頁為起點，回溯最多 MAX_PAGES 頁，收集「今日」且符合目標前綴的文章：
-    # - buckets 以前綴分類（BOX、情報三類）
-    # - STOP_AT_FIRST_OLDER=True 時，遇到第一筆非今日即停止（加速）
-    today = datetime.date.today()
-    today_str = today.strftime("%Y/%m/%d")
-
-    current_url = INDEX_URL  # 起始索引頁
-    pages = 0
-    buckets = {"BOX": [], "INFO_CONTRACT": [], "INFO_INJURIED": [], "INFO_OTHER": []}  # 結果桶
-
-    while current_url and pages < MAX_PAGES:
-        html = fetch_page(session, current_url)  # 取得頁面 HTML（可能拋錯）
-        entries = parse_entries(html, today=today)
-
-        # 日誌：觀察頁面日期分布（偵測排序異常）
-        seen_mmdd = [e.get("ptt_mmdd") or "" for e in entries]
-        if seen_mmdd:
-            try:
-                mmdd_sorted = sorted(seen_mmdd)
-                newest = mmdd_sorted[-1]; oldest = mmdd_sorted[0]
-                write_ptt_log(time.time(), f"[PTT_PAGE_DATE_STATS] page={pages+1} today_seen={sum(1 for e in entries if e.get('full_date')==today_str)} total_seen={len(entries)} newest={newest} oldest={oldest}", None)
-            except Exception as _:
-                write_ptt_log(time.time(), f"[PTT_PAGE_DATE_STATS_ERR] page={pages+1}", None)
-
-        # 僅保留今日條目，再依目標前綴過濾
-        entries_today = [e for e in entries if e.get("full_date") == today_str]
-        entries_today = filter_by_target_prefix(entries_today, TARGET_PREFIXES)
-
-        # [新增] 印出本頁每一筆抓到的原始條目（過濾後）
-        for i, e in enumerate(entries_today, start=1):
-            write_ptt_log(time.time(), f"[PTT][RAW] page={pages+1} idx={i}, date={e.get('full_date')} mmdd={e.get('ptt_mmdd')}, prefix={e.get('prefix')}, title={e.get('title')}, title_no_prefix={e.get('title_no_prefix')}, url={e.get('url')}", None)
-
-        # 分桶：BOX 與 情報（情報需再分類為合約/傷病/其他）
-        for e in entries_today:
-            if e.get("prefix") == "BOX":
-                buckets["BOX"].append(e)
-            elif e.get("prefix") == "情報":
-                k = classify_info(e.get("title", ""))
-                buckets[k].append(e)
-
-        # 繼續往上一頁
-        prev_url = find_prev_page_url(html)
-        if not prev_url:
-            break  # 沒有上一頁或結構變動：停止
-        current_url = prev_url
-        pages += 1
-    write_ptt_log(time.time(), buckets, None)
-
-    return buckets  # 回傳分類後的今日文章集合
-
-def normalize_url(u: str) -> str:
-    # 去除末尾常見標點/括號
-    return u.rstrip(').,;!?>"]\'')
-
-def is_ptt_nba_url(u: str) -> bool:
-    return isinstance(u, str) and u.startswith(PTT_BASE)
-
-def extract_urls_from_message(msg) -> set:
-    urls = set()
-
-    # 文字內容
-    content = getattr(msg, "content", None)
-    if content:
-        for m in URL_RE.findall(content):
-            u = normalize_url(m)
-            if is_ptt_nba_url(u):
-                urls.add(u)
-
-    # embeds
-    embeds = getattr(msg, "embeds", None)
-    if embeds:
-        for emb in embeds:
-            # 直接 URL 欄位
-            if getattr(emb, "url", None):
-                u = normalize_url(emb.url)
-                if is_ptt_nba_url(u):
-                    urls.add(u)
-            # 圖片/縮圖的 URL
-            thumb = getattr(emb, "thumbnail", None)
-            if thumb and getattr(thumb, "url", None):
-                u = normalize_url(thumb.url)
-                if is_ptt_nba_url(u):
-                    urls.add(u)
-            image = getattr(emb, "image", None)
-            if image and getattr(image, "url", None):
-                u = normalize_url(image.url)
-                if is_ptt_nba_url(u):
-                    urls.add(u)
-            # 也可掃 emb.description/fields 文字（視需求再加）
-
-    # 附件
-    attachments = getattr(msg, "attachments", None)
-    if attachments:
-        for att in attachments:
-            if getattr(att, "url", None):
-                u = normalize_url(att.url)
-                if is_ptt_nba_url(u):
-                    urls.add(u)
-
-    return urls
-
-async def collect_seen_ptt_urls_from_channel(channel, limit: int = 20) -> set:
-    seen = set()
-    try:
-        async for msg in channel.history(limit=limit):
-            seen |= extract_urls_from_message(msg)
-    except Exception as e:
-        print(f"[WARN] fetch history failed ch={getattr(channel,'id',None)} err={e}")
-    return seen
-
-# ===== 頻道錨點與去重管理（AsaBox 用）=====
-ANCHOR_URL_REGEX = re.compile(r'https?://[^\s]+', re.IGNORECASE)  # 抓取訊息中第一個 URL（直到空白）
-
-class ChannelAnchorManager:
-    def __init__(self):
-        # map：每個分類對應 Discord 頻道與最後錨點 URL（last_url）
-        self.map = {
-            "BOX": {"channel_id": CHANNEL_GAME_BOX, "last_url": None},
-            "INFO_CONTRACT": {"channel_id": CHANNEL_CONTRACT, "last_url": None},
-            "INFO_INJURIED": {"channel_id": CHANNEL_INJURIED, "last_url": None},
-            "INFO_OTHER": {"channel_id": CHANNEL_INTELLIGENCE_NEWS, "last_url": None},
-        }
-        self.sent_urls = set()  # 全域已發送 URL 集合（跨分類用於去重）
-
-    async def load_last_anchors(self, client: discord.Client, started_at: float):
-        # 從各目標頻道讀取最近（最多 100 則）由 bot 發送的訊息，擷取首個 URL 當作錨點
-        # - 目的：之後從來源列表倒序掃描時，遇錨點就停止（避免重覆推播）
-        for key, rec in self.map.items():
-            ch_id = rec["channel_id"]
-            if not ch_id:
-                continue
-            try:
-                # 先從快取取頻道，沒有則 API 取回
-                channel = client.get_channel(ch_id) or await client.fetch_channel(ch_id)
-            except Exception as e:
-                print(f"[WARN] fetch_channel({ch_id}) failed: {e}")
-                continue
-
-            last_url = None
-            try:
-                # 掃描頻道歷史訊息，限定 100 則
-                async for msg in channel.history(limit=100):
-                    if msg.author.bot:  # 只認 bot 自己/其他 bot 的訊息作為錨點（避免人類貼文干擾）
-                        m = ANCHOR_URL_REGEX.search(msg.content or "")
-                        if m:
-                            last_url = m.group(0)  # 擷取第一個 URL
-                            break
-                rec["last_url"] = last_url
-                if last_url:
-                    self.sent_urls.add(last_url)  # 也加入 sent_urls，避免再次推送
-                print(f"[ANCHOR] {key} channel={ch_id} last_url={last_url}")
-                # 使用呼叫端傳入的 started_at 寫日誌，避免 AttributeError
-                write_ptt_log(started_at, f"[ANCHOR] {key} channel={ch_id} last_url={last_url}", None)
-            except Exception as e:
-                print(f"[WARN] load_last_anchor for {key} failed: {e}")
-
-    def stop_when_hit_anchor(self, key: str, items: list):
-        # 給定分類 key 與項目清單 items（通常已按時間新->舊或舊->新排序）
-        # - 若遇到錨點 URL（last_url）即停止收集
-        # - 若項目 URL 已在 sent_urls 也跳過（避免重發）
-        # - 回傳需「新發送」的 items（保持原順序）
-        rec = self.map.get(key)
-        print(f"rec = {rec}")
-        if not rec:
-            return []
-        anchor = rec.get("last_url")
-        print(f"anchor = {anchor}")
-        if not items:
-            return []
-        collected = []
-        for it in items:
-            print(f"items = {items}, it = {it}")
-            u = it.get("url")
-            if not u:
-                continue
-            if anchor and u == anchor:
-                break  # 命中錨點：停止再往後收集
-            if u in self.sent_urls:
-                continue  # 已發送過：略過
-            collected.append(it)  # 新的、未發送過的：加入
-        return collected
-
-    def mark_sent(self, key: str, items: list):
-        # 發送完成後，標記已發送：
-        # - 更新此分類的 last_url 為這批的第一則 URL（視需求可改為最後一則）
-        # - 將所有 items 的 URL 加入 sent_urls
-        if not items:
-            return
-        u_first = items[0].get("url")
-        if u_first:
-            self.map[key]["last_url"] = u_first
-        for it in items:
-            u = it.get("url")
-            if u:
-                self.sent_urls.add(u)
-
+    
+# --- 共用：刪除重複訊息工具（兩個 Bot 共用） ---
 # ===== 共同工具：刪除重複訊息（跨 Bot 可用，含日誌）=====
 async def delete_duplicate_messages(
     client: discord.Client,
@@ -894,139 +445,134 @@ async def delete_duplicate_messages(
     # 回傳總刪除數，供呼叫端顯示或後續決策使用
     return total_deleted
 
-# ===== AsaBot：IG/X 清理 + 媒體限定監控 + 去重指令 + 連線檢查 =====
-class AsaBot(discord.Client):
-    def __init__(self, *args, **kwargs):
-        # 初始化：記錄啟動時間，以便回覆 !ping
-        super().__init__(*args, **kwargs)
-        self.started_at = time.time()
+# --- 共用：兩個 Bot 啟動與重試 ---
+async def run_bot_with_retry(client, token: str, name: str, retry_delay: int = 30):
 
-    async def on_ready(self):
-        # Bot 登入成功後：
-        # - 印出登入身分
-        # - 啟動 heartbeat 背景任務（固定間隔輸出心跳）
-        # - 若設定 AUTO_DEDUPE_ON_START，啟動一次去重掃描
-        print(f"[READY] AsaBot logged in as {self.user}")
-        asyncio.create_task(self.heartbeat())
-        if AUTO_DEDUPE_ON_START:
-            asyncio.create_task(self.run_dedupe_once())
-
-    async def heartbeat(self):
-        # 心跳背景任務：每 HEARTBEAT_INTERVAL_SEC 秒輸出一次時間戳（健康檢查用途）
-        while True:
-            print(f"[HEARTBEAT-AsaBot] {time.strftime('%Y-%m-%d %H:%M:%S')}")
-            await asyncio.sleep(HEARTBEAT_INTERVAL_SEC)
-
-    async def run_dedupe_once(self):
-        # 啟動時自動掃描去重的頻道集合（可依需求調整）
-        channel_ids = [
-            CHANNEL_SHARING_GIRL, CHANNEL_SHARING_BOY, CHANNEL_INJURIED,
-            CHANNEL_GAME_BOX, CHANNEL_CONTRACT, CHANNEL_INTELLIGENCE_NEWS
-        ]
-        total = await delete_duplicate_messages(self, channel_ids, DUPLICATE_SCAN_LIMIT, source="auto.Asabot")
-        print(f"[DEDUPE] finished on start. total_deleted={total}")
-
-    async def on_message(self, message: discord.Message):
-        # 事件：收到新訊息
+    # 無窮重試迴圈，
+    # 確保機器人在錯誤後能自動恢復
+    while True:
         try:
-            if message.author.id == self.user.id:
-                return  # 忽略自己發出的訊息，避免自觸發
-
-            content = (message.content or "").strip().lower()
-
-            # 連線檢查指令：!ping -> 回覆延遲、啟動時間、心跳間隔
-            if content == "!ping":
-                latency_ms = round(self.latency * 1000) if self.latency is not None else -1
-                started = _ts(self.started_at)  # 將 epoch 轉可讀字串（假設 _ts 已定義）
-                await message.channel.send(f"Pong! 延遲: {latency_ms} ms | 啟動時間: {started} | 心跳: {HEARTBEAT_INTERVAL_SEC}s")
-                return
-
-            # 手動去重：!dedupe（需 Manage Messages 或管理員）
-            if content == "!dedupe":
-                perms = message.channel.permissions_for(message.author)
-                if not (perms.manage_messages or perms.administrator):
-                    await message.reply("需要 Manage Messages 權限才能執行去重。")
-                    return
-                await message.channel.send("開始去重，請稍候...")
-                channel_ids = [
-                    CHANNEL_SHARING_GIRL, CHANNEL_SHARING_BOY, CHANNEL_INJURIED,
-                    CHANNEL_GAME_BOX, CHANNEL_CONTRACT, CHANNEL_INTELLIGENCE_NEWS
-                ]
-                total = await delete_duplicate_messages(self, channel_ids, DUPLICATE_SCAN_LIMIT, source="manual.Asabot")
-                await message.channel.send(f"去重完成，刪除重複訊息共 {total} 則。")
-                return
-
-            # IG/X 連結清理（不限制頻道）：偵測原始連結並回覆對應的「乾淨」頁面
-            if content:
-                replies = []
-
-                # Instagram -> kkinstagram
-                for match in INSTAGRAM_URL_PATTERN.finditer(message.content or ""):
-                    cleaned = f"https://www.kkinstagram.com/{match.group(2)}/{match.group(3)}/"
-                    replies.append(cleaned)
-
-                # Twitter/X -> fxtwitter
-                for match in TWITTER_URL_PATTERN.finditer(message.content or ""):
-                    user = match.group('user')
-                    twid = match.group('id1') or match.group('id2')
-                    if user and twid:
-                        cleaned = f"https://fxtwitter.com/{user}/status/{twid}"
-                    elif twid:
-                        cleaned = f"https://fxtwitter.com/i/web/status/{twid}"
-                    else:
-                        continue
-                    replies.append(cleaned)
-
-                if replies:
-                    # 使用 dict.fromkeys 去重並保留原順序，再一次性回覆
-                    unique_replies = list(dict.fromkeys(replies))
-                    await message.channel.send("\n".join(unique_replies))
-
-            # 媒體限定監控（僅針對特定禁聊頻道）：無媒體則刪文並提示
-            if message.channel.id in TARGET_MEDIA_CHANNELS:
-                # 判斷附件是否為圖片/影片（透過 content_type 或副檔名）
-                has_attachment_media = any(
-                    (att.content_type or "").startswith("image/")
-                    or (att.content_type or "").startswith("video/")
-                    or (att.filename or "").lower().endswith(tuple(IMG_EXT | VID_EXT))
-                    for att in message.attachments
-                )
-                # 判斷文字中的 URL 是否屬於可嵌入媒體站或具媒體副檔名
-                urls = URL_PATTERN.findall(message.content or "")
-                has_media_url = any(is_media_url(u) for u in urls)
-
-                if not (has_attachment_media or has_media_url):
-                    # 嘗試刪除訊息；若無權限，給出臨時警告訊息
-                    try:
-                        await message.delete()
-                    except discord.Forbidden:
-                        # 缺刪除權限：發一則 5 秒後自刪的告知訊息
-                        warn = await message.channel.send(
-                            "此頻道僅允許圖片 / 影片或含內嵌媒體的連結。請重新張貼，謝謝。（缺少刪除訊息權限）"
-                        )
-                        await asyncio.sleep(5)
-                        with contextlib.suppress(Exception):
-                            await warn.delete()
-                        return
-                    except discord.HTTPException as e:
-                        print(f"[ERROR] delete failed: {e}")
-                        return
-
-                    # 刪除成功：再發一則點名的提示，5 秒後自刪
-                    try:
-                        tip = await message.channel.send(
-                            f"{message.author.mention} 此頻道僅允許圖片 / 影片或含內嵌媒體的連結，請重新張貼，謝謝。"
-                        )
-                        await asyncio.sleep(5)
-                        with contextlib.suppress(Exception):
-                            await tip.delete()
-                    except Exception as e:
-                        print(f"[ERROR] tip send/delete failed: {e}")
-
+            # 啟動 Discord 客戶端，
+            # 進入連線與事件迴圈
+            await client.start(token)
         except Exception as e:
-            # on_message 最外層保護，避免單筆錯誤中斷事件處理
-            print(f"[ERROR-AsaBot] on_message: {e}")
+            # 記錄啟動錯誤，
+            # 並輸出重試等待秒數
+            print(f"[{name}] error: {e}, retry in {retry_delay}s")
 
+            # 寫入錯誤日誌，
+            # 帶上目前時間戳與錯誤訊息
+            write_ptt_log(time.time(), f"{name}_ERROR", str(e))
+
+            # 睡眠 retry_delay 秒後重試
+            await asyncio.sleep(retry_delay)
+
+# =========================
+# 2) YT區（YouTube 監控/通知）
+# =========================
+
+# --- YT：環境/設定 ---
+
+# 從 .env 讀取（注意你的環境變數大小寫）
+YOUTUBE_CHANNEL_ID = os.getenv("YOUTUBE_CHANNEL_ID", "").strip()  # 目標 YouTube 頻道 ID
+YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "").strip()        # YouTube Data API 金鑰
+DISCORD_WEBHOOK_URL_YT = os.getenv("DISCORD_WEBHOOK_URL", "").strip()  # 用於推播 YouTube 更新的 Discord Webhook
+
+LAST_CHECKED_FILE = BASE_DIR / (os.getenv("LAST_CHECKED_FILE", "last_checked_videos.json"))  # 已檢查影片記錄檔
+YT_CHECK_INTERVAL_SECONDS = int(os.getenv("YT_CHECK_INTERVAL_SECONDS", "3600"))  # YouTube 檢查週期（秒，預設每小時）
+
+# --- YT：工具與 API 客戶端 ---
+def _seconds_until_next_1505(now: datetime.datetime | None = None) -> int:
+    # 計算距離下一次 15:05 的秒數（最少回傳 1 秒）
+    now = now or datetime.datetime.now()
+    target_today = now.replace(hour=15, minute=5, second=0, microsecond=0)
+    target = target_today if now <= target_today else (target_today + datetime.timedelta(days=1))
+    return max(1, int((target - now).total_seconds()))
+
+def _yt_build_service():
+    # 建立 YouTube Data API v3 的 service 物件；缺金鑰則拋錯，提醒設定 .env
+    if not YOUTUBE_API_KEY:
+        raise RuntimeError(f"Missing Youtube_API_KEY in .env at {ENV_PATH}")
+    return build('youtube', 'v3', developerKey=YOUTUBE_API_KEY)
+
+def _yt_get_channel_uploads_playlist_id(youtube, channel_id: str) -> str | None:
+    # 用 channel_id 取回該頻道的「uploads」播放清單 ID（頻道所有上傳影片）
+    resp = youtube.channels().list(part="contentDetails", id=channel_id).execute()
+    items = resp.get('items') or []
+    if items:
+        return items[0]['contentDetails']['relatedPlaylists']['uploads']  # 取第一筆的 uploads 欄位
+    return None  # 找不到頻道或缺欄位時回傳 None
+
+def _yt_get_latest_videos_from_playlist(youtube, playlist_id: str, max_results: int = 10) -> list[dict]:
+    # 以播放清單 ID 抓取最新影片（回傳字典列表：id/title/publishedAt/url）
+    resp = youtube.playlistItems().list(
+        part="snippet,contentDetails",
+        playlistId=playlist_id,
+        maxResults=max_results
+    ).execute()
+    videos = []
+    for item in resp.get('items', []):
+        vid = item['contentDetails']['videoId']
+        title = item['snippet']['title']
+        published_at = item['snippet']['publishedAt']  # ISO 8601 格式時間
+        videos.append({"id": vid, "title": title, "publishedAt": published_at, "url": f"https://www.youtube.com/watch?v={vid}"})
+    return videos
+
+def _yt_load_last_checked() -> list[dict]:
+    # 載入上次檢查記錄（JSON 檔）：若無或錯誤則回空列表
+    try:
+        if LAST_CHECKED_FILE.exists():
+            with open(LAST_CHECKED_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)  # 預期為 list[dict]，含 id/title/publishedAt/url
+    except Exception:
+        pass  # 可選：yt_log("YT_LOAD_LAST_CHECKED_FAILED", str(e), level="WARN")
+    return []
+
+def _yt_save_last_checked(videos: list[dict]):
+    # 保存本次檢查的影片列表到 JSON：格式化縮排便於手動檢視
+    try:
+        with open(LAST_CHECKED_FILE, 'w', encoding='utf-8') as f:
+            json.dump(videos, f, ensure_ascii=False, indent=4)
+    except Exception as e:
+        write_ptt_log(time.time(), "YT_SAVE_LAST_CHECKED_FAILED", str(e))  # 失敗記錄於一般日誌
+
+def _yt_send_discord_message(title: str, url: str):
+    # 將新影片通知以 Discord Webhook 推送：content=標題 + URL
+    if not DISCORD_WEBHOOK_URL_YT:
+        write_ptt_log(time.time(), "YT_WEBHOOK_MISSING", "DISCORD_WEBHOOK_URL not set")
+        return
+    payload = {"content": f"{title}\n{url}"}
+    try:
+        r = requests.post(DISCORD_WEBHOOK_URL_YT, json=payload, timeout=10)  # POST JSON，10 秒 timeout
+        if r.status_code not in (200, 204):
+            write_ptt_log(time.time(), "YT_WEBHOOK_FAIL", f"{r.status_code} {r.text}")  # 非成功狀態碼記錄
+    except Exception as e:
+        write_ptt_log(time.time(), "YT_WEBHOOK_EXCEPTION", str(e))  # 例外記錄
+
+def _extract_id(item: dict) -> str | None:
+    # 從影片項目擷取 videoId：
+    # - 你的來源（_yt_get_latest_videos_from_playlist）已含 "id"
+    # - 若來源不同（例如直接用 playlistItems 原生結構），則相容 contentDetails.videoId
+    return item.get("id") or item.get("contentDetails", {}).get("videoId")
+
+def _parse_ts(ts: str | None) -> float:
+    # 將 ISO 8601（含 Z）時間字串轉為 epoch 秒數；解析失敗回傳 0.0
+    # 例：2024-10-01T12:34:56Z -> 轉為 UTC 時區的 timestamp
+    if not ts:
+        return 0.0
+    try:
+        return datetime.datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return 0.0  # 解析失敗時給零，方便排序時自然排在最前（或視情況調整）
+
+def _sort_by_published(items: list[dict]) -> list[dict]:
+    # 依發布時間（publishedAt）排序由舊到新：
+    # - 優先讀取 item["publishedAt"]
+    # - 若沒有，嘗試讀取 item["snippet"]["publishedAt"]
+    # - 使用 _parse_ts 將字串轉 timestamp 作為排序 key
+    return sorted(items, key=lambda it: _parse_ts(it.get("publishedAt") or it.get("snippet", {}).get("publishedAt")))
+
+# --- YT：主監控迴圈 ---
 # ========== 你的 YouTube 監控迴圈（已加完整 LOG） ==========
 async def youtube_monitor_loop():
     # 啟動監控：印出啟動訊息與紀錄 LOG，方便在系統啟動時追蹤
@@ -1236,6 +782,427 @@ async def youtube_monitor_loop():
             # 真正進入睡眠（非阻塞），讓事件迴圈在這段時間內可處理其他協程
             await asyncio.sleep(sleep_seconds)
 
+# =========================
+# 3) 監控區（AsaBot：IG/X 清理、媒體限定、去重指令、心跳）
+# =========================
+# ===== AsaBot：IG/X 清理 + 媒體限定監控 + 去重指令 + 連線檢查 =====
+class AsaBot(discord.Client):
+    def __init__(self, *args, **kwargs):
+        # 初始化：記錄啟動時間，以便回覆 !ping
+        super().__init__(*args, **kwargs)
+        self.started_at = time.time()
+
+    async def on_ready(self):
+        # Bot 登入成功後：
+        # - 印出登入身分
+        # - 啟動 heartbeat 背景任務（固定間隔輸出心跳）
+        # - 若設定 AUTO_DEDUPE_ON_START，啟動一次去重掃描
+        print(f"[READY] AsaBot logged in as {self.user}")
+        asyncio.create_task(self.heartbeat())
+        if AUTO_DEDUPE_ON_START:
+            asyncio.create_task(self.run_dedupe_once())
+
+    async def heartbeat(self):
+        # 心跳背景任務：每 HEARTBEAT_INTERVAL_SEC 秒輸出一次時間戳（健康檢查用途）
+        while True:
+            print(f"[HEARTBEAT-AsaBot] {time.strftime('%Y-%m-%d %H:%M:%S')}")
+            await asyncio.sleep(HEARTBEAT_INTERVAL_SEC)
+
+    async def run_dedupe_once(self):
+        # 啟動時自動掃描去重的頻道集合（可依需求調整）
+        channel_ids = [
+            CHANNEL_SHARING_GIRL, CHANNEL_SHARING_BOY, CHANNEL_INJURIED,
+            CHANNEL_GAME_BOX, CHANNEL_CONTRACT, CHANNEL_INTELLIGENCE_NEWS
+        ]
+        total = await delete_duplicate_messages(self, channel_ids, DUPLICATE_SCAN_LIMIT, source="auto.Asabot")
+        print(f"[DEDUPE] finished on start. total_deleted={total}")
+
+    async def on_message(self, message: discord.Message):
+        # 事件：收到新訊息
+        try:
+            if message.author.id == self.user.id:
+                return  # 忽略自己發出的訊息，避免自觸發
+
+            content = (message.content or "").strip().lower()
+
+            # 連線檢查指令：!ping -> 回覆延遲、啟動時間、心跳間隔
+            if content == "!ping":
+                latency_ms = round(self.latency * 1000) if self.latency is not None else -1
+                started = _ts(self.started_at)  # 將 epoch 轉可讀字串（假設 _ts 已定義）
+                await message.channel.send(f"Pong! 延遲: {latency_ms} ms | 啟動時間: {started} | 心跳: {HEARTBEAT_INTERVAL_SEC}s")
+                return
+
+            # 手動去重：!dedupe（需 Manage Messages 或管理員）
+            if content == "!dedupe":
+                perms = message.channel.permissions_for(message.author)
+                if not (perms.manage_messages or perms.administrator):
+                    await message.reply("需要 Manage Messages 權限才能執行去重。")
+                    return
+                await message.channel.send("開始去重，請稍候...")
+                channel_ids = [
+                    CHANNEL_SHARING_GIRL, CHANNEL_SHARING_BOY, CHANNEL_INJURIED,
+                    CHANNEL_GAME_BOX, CHANNEL_CONTRACT, CHANNEL_INTELLIGENCE_NEWS
+                ]
+                total = await delete_duplicate_messages(self, channel_ids, DUPLICATE_SCAN_LIMIT, source="manual.Asabot")
+                await message.channel.send(f"去重完成，刪除重複訊息共 {total} 則。")
+                return
+
+            # IG/X 連結清理（不限制頻道）：偵測原始連結並回覆對應的「乾淨」頁面
+            if content:
+                replies = []
+
+                # Instagram -> kkinstagram
+                for match in INSTAGRAM_URL_PATTERN.finditer(message.content or ""):
+                    cleaned = f"https://www.kkinstagram.com/{match.group(2)}/{match.group(3)}/"
+                    replies.append(cleaned)
+
+                # Twitter/X -> fxtwitter
+                for match in TWITTER_URL_PATTERN.finditer(message.content or ""):
+                    user = match.group('user')
+                    twid = match.group('id1') or match.group('id2')
+                    if user and twid:
+                        cleaned = f"https://fxtwitter.com/{user}/status/{twid}"
+                    elif twid:
+                        cleaned = f"https://fxtwitter.com/i/web/status/{twid}"
+                    else:
+                        continue
+                    replies.append(cleaned)
+
+                if replies:
+                    # 使用 dict.fromkeys 去重並保留原順序，再一次性回覆
+                    unique_replies = list(dict.fromkeys(replies))
+                    await message.channel.send("\n".join(unique_replies))
+
+            # 媒體限定監控（僅針對特定禁聊頻道）：無媒體則刪文並提示
+            if message.channel.id in TARGET_MEDIA_CHANNELS:
+                # 判斷附件是否為圖片/影片（透過 content_type 或副檔名）
+                has_attachment_media = any(
+                    (att.content_type or "").startswith("image/")
+                    or (att.content_type or "").startswith("video/")
+                    or (att.filename or "").lower().endswith(tuple(IMG_EXT | VID_EXT))
+                    for att in message.attachments
+                )
+                # 判斷文字中的 URL 是否屬於可嵌入媒體站或具媒體副檔名
+                urls = URL_PATTERN.findall(message.content or "")
+                has_media_url = any(is_media_url(u) for u in urls)
+
+                if not (has_attachment_media or has_media_url):
+                    # 嘗試刪除訊息；若無權限，給出臨時警告訊息
+                    try:
+                        await message.delete()
+                    except discord.Forbidden:
+                        # 缺刪除權限：發一則 5 秒後自刪的告知訊息
+                        warn = await message.channel.send(
+                            "此頻道僅允許圖片 / 影片或含內嵌媒體的連結。請重新張貼，謝謝。（缺少刪除訊息權限）"
+                        )
+                        await asyncio.sleep(5)
+                        with contextlib.suppress(Exception):
+                            await warn.delete()
+                        return
+                    except discord.HTTPException as e:
+                        print(f"[ERROR] delete failed: {e}")
+                        return
+
+                    # 刪除成功：再發一則點名的提示，5 秒後自刪
+                    try:
+                        tip = await message.channel.send(
+                            f"{message.author.mention} 此頻道僅允許圖片 / 影片或含內嵌媒體的連結，請重新張貼，謝謝。"
+                        )
+                        await asyncio.sleep(5)
+                        with contextlib.suppress(Exception):
+                            await tip.delete()
+                    except Exception as e:
+                        print(f"[ERROR] tip send/delete failed: {e}")
+
+        except Exception as e:
+            # on_message 最外層保護，避免單筆錯誤中斷事件處理
+            print(f"[ERROR-AsaBot] on_message: {e}")
+
+# =========================
+# 4) PTT掃描區（PTT 抓取/解析/分類 + AsaBox 推送/歷史去重 + 心跳）
+# =========================
+
+# --- PTT 設定 ---
+# PTT 設定（AsaBox 使用）
+BASE_URL = "https://www.ptt.cc"  # PTT 主站域名（用於拼接相對連結）
+INDEX_URL = os.getenv("NBA_PTT_URL", "https://www.ptt.cc/bbs/NBA/index.html")  # 看板索引頁 URL
+FETCH_INTERVAL = int(os.getenv("PTT_FETCH_INTERVAL_SEC", "900"))  # 抓取週期（秒）
+MAX_PAGES = int(os.getenv("PTT_MAX_PAGES", "12"))  # 最大索引頁數回溯
+ONLY_TODAY = os.getenv("PTT_ONLY_TODAY", "true").lower() == "true"  # 僅抓取今日文章
+STOP_AT_FIRST_OLDER = os.getenv("PTT_STOP_AT_FIRST_OLDER", "true").lower() == "true"  # 遇到非今日即停
+TARGET_PREFIXES = [p.strip() for p in os.getenv("PTT_TARGET_PREFIXES", "BOX,情報").split(",") if p.strip()]  # 目標標題前綴
+KEYWORDS_INJURY = [w.strip() for w in os.getenv("KEYWORDS_INJURY", "").split(",") if w.strip()]  # 傷病關鍵字
+CONTRACT_PATTERNS = [p.strip() for p in os.getenv("KEYWORDS_CONTRACT_PATTERNS", "").split(";") if p.strip()]  # 合約模式（分號分隔）
+NEGATIVE_FOR_CONTRACT_TITLE = [w.strip() for w in os.getenv("NEGATIVE_FOR_CONTRACT_TITLE", "").split(",") if w.strip()]  # 合約負面排除字
+
+PTT_BASE = INDEX_URL
+URL_RE = re.compile(r'https?://\S+')
+
+# --- PTT：網頁抓取工具 ---
+# ===== PTT/NBA 工具（AsaBox 用）=====
+def make_session():
+    # 建立 requests Session，帶入：
+    # - over18=1 cookie（跳過 PTT 年齡確認）
+    # - 自訂 UA（避免被視為爬蟲或取得較穩定結果）
+    s = requests.Session()
+    s.cookies.set('over18', '1', domain='.ptt.cc')
+    s.headers.update({"User-Agent": "Mozilla/5.0 (compatible; PTTFetcher/2.1)"})
+    return s
+
+def fetch_page(session, url):
+    # 以既有 session 取頁面，10 秒逾時；狀態碼非 2xx 時 raise_for_status 拋錯
+    resp = session.get(url, timeout=10)
+    resp.raise_for_status()
+    return resp.text  # 回傳 HTML 文字
+
+# --- PTT：解析/分類工具 ---
+def extract_bracket_prefix(title: str):
+    # 解析標題前綴（中括號）：
+    # [BOX] XXX -> 回傳 ("BOX", "XXX")
+    # 規則：
+    # - 以 '[' 開頭且存在 ']'，取中間內容為 prefix（移除空白）
+    # - remaining 為 ']' 之後的標題（去除左側空白）
+    # - 內容空字串時回傳 None 作為 prefix
+    t = title.strip()
+    if len(t) >= 3 and t[0] == '[':
+        close_idx = t.find(']')
+        if close_idx != -1:
+            inner = ''.join(t[1:close_idx].strip().split())  # 去空白與中間空白（確保一致性）
+            remaining = t[close_idx+1:].lstrip()
+            return (inner if inner else None), remaining
+    return None, t  # 無中括號前綴時：prefix=None, remaining=整標題
+
+def ptt_date_to_full_date(mmdd: str, today: datetime.date):
+    # 將 PTT 列表的日期（MM/DD）轉為 "YYYY/MM/DD"：
+    # - 年份取今日年份（PTT 列表不含年）
+    # - 不可解析或數值非法則回傳 None
+    parts = (mmdd or "").strip().split('/')
+    if len(parts) != 2:
+        return None
+    try:
+        m = int(parts[0].strip()); d = int(parts[1].strip())
+        return datetime.date(today.year, m, d).strftime("%Y/%m/%d")
+    except ValueError:
+        return None
+
+def parse_entries(html: str, today: datetime.date):
+    # 解析索引頁 HTML，擷取每筆文章資訊：
+    # - title: 原始標題
+    # - title_no_prefix: 去除中括號前綴後的標題
+    # - prefix: 中括號內前綴（BOX／情報 等）
+    # - ptt_mmdd: PTT 列表顯示的 MM/DD
+    # - full_date: 轉為 "YYYY/MM/DD"（以 today 年份）
+    # - url: 文章完整 URL
+    soup = BeautifulSoup(html, "html.parser")
+    rlist = soup.select("div.r-list-container div.r-ent")  # PTT 列表條目
+    results = []
+    for ent in rlist:
+        title_div = ent.select_one("div.title")
+        date_div = ent.select_one("div.meta > div.date")
+        if not title_div or not date_div:
+            continue  # 結構不完整：略過
+        a = title_div.find("a")
+        if not a:
+            continue  # 例如已刪文或無連結：略過
+        title_text = a.get_text(strip=True)
+        prefix, remaining_title = extract_bracket_prefix(title_text)  # 解析前綴
+        href = a.get("href")
+        full_url = urljoin(BASE_URL, href) if href else None
+        date_text = date_div.get_text(strip=True)
+        full_date = ptt_date_to_full_date(date_text, today)
+        results.append({
+            "title": title_text,
+            "title_no_prefix": remaining_title,
+            "prefix": prefix,
+            "ptt_mmdd": date_text,
+            "full_date": full_date,
+            "url": full_url
+        })
+    return results
+    
+def find_prev_page_url(html: str):
+    # 從索引頁 HTML 找到「上頁」連結（上一頁 index.html）：
+    # - 目標選擇器：div.btn-group-paging 內 a.btn.wide[href]
+    # - 文字含「上頁」且 href 包含 "index" 且 .html 結尾
+    soup = BeautifulSoup(html, "html.parser")
+    paging = soup.select_one("div.btn-group-paging")
+    if not paging:
+        return None
+    for a in paging.select("a.btn.wide[href]"):
+        text = a.get_text(strip=True)
+        href = a["href"]
+        if "上頁" in text and "index" in href and href.endswith(".html"):
+            return urljoin(BASE_URL, href)
+    return None  # 找不到則回傳 None
+
+def filter_by_target_prefix(items, target_prefixes):
+    # 依目標前綴過濾項目（空集合時回傳原列表）：
+    # - 只保留 prefix 在 target_prefixes 內的文章
+    if not target_prefixes:
+        return items
+    return [it for it in items if (it.get("prefix") or "") in target_prefixes]
+
+def is_injury(title: str) -> bool:
+    # 判斷是否為「傷病」資訊：
+    # - 將標題轉小寫，檢查是否包含 KEYWORDS_INJURY 任一關鍵字（亦轉小寫）
+    tl = (title or "").lower()
+    return any(kw.lower() in tl for kw in KEYWORDS_INJURY)
+
+def is_contract(title: str) -> bool:
+    # 判斷是否為「合約／交易」資訊：
+    # - 先做負面排除（NEGATIVE_FOR_CONTRACT_TITLE）
+    # - 再以 CONTRACT_PATTERNS（正則）匹配標題（忽略大小寫）
+    t = title or ""
+    tl = t.lower()
+    if any(neg.lower() in tl for neg in NEGATIVE_FOR_CONTRACT_TITLE):
+        return False
+    for pat in CONTRACT_PATTERNS:
+        if re.search(pat, t, flags=re.IGNORECASE):
+            return True
+    return False
+
+def classify_info(title: str) -> str:
+    # 將情報類別分類為三種：
+    # - INFO_INJURIED（傷病）/ INFO_CONTRACT（合約交易）/ INFO_OTHER（其他）
+    if is_injury(title):
+        return "INFO_INJURIED"
+    if is_contract(title):
+        return "INFO_CONTRACT"
+    return "INFO_OTHER"
+
+def build_content_box(full_date: str, title_no_prefix: str, url: str):
+    # 組合 BOX 類訊息內容（便於推播到 Discord）
+    # 格式：
+    # YYYY/MM/DD
+    # [BOX] <去前綴標題>
+    # <文章 URL>
+    return f"{full_date}\n[BOX] {title_no_prefix}\n{url}"
+
+def build_content_info(full_date: str, info_type: str, title_no_prefix: str, url: str):
+    # 組合 情報 類訊息內容，依 info_type 映射中文標籤
+    label_map = {
+        "INFO_CONTRACT": "情報-合約/交易",
+        "INFO_INJURIED": "情報-受傷",
+        "INFO_OTHER": "情報-其他",
+    }
+    label = label_map.get(info_type, "情報")
+    return f"{full_date}\n[{label}] {title_no_prefix}\n{url}"
+
+# --- PTT：收集今日文章（分類） ---
+def collect_today(session):
+    # 以 PTT 索引頁為起點，回溯最多 MAX_PAGES 頁，收集「今日」且符合目標前綴的文章：
+    # - buckets 以前綴分類（BOX、情報三類）
+    # - STOP_AT_FIRST_OLDER=True 時，遇到第一筆非今日即停止（加速）
+    today = datetime.date.today()
+    today_str = today.strftime("%Y/%m/%d")
+
+    current_url = INDEX_URL  # 起始索引頁
+    pages = 0
+    buckets = {"BOX": [], "INFO_CONTRACT": [], "INFO_INJURIED": [], "INFO_OTHER": []}  # 結果桶
+
+    while current_url and pages < MAX_PAGES:
+        html = fetch_page(session, current_url)  # 取得頁面 HTML（可能拋錯）
+        entries = parse_entries(html, today=today)
+
+        # 日誌：觀察頁面日期分布（偵測排序異常）
+        seen_mmdd = [e.get("ptt_mmdd") or "" for e in entries]
+        if seen_mmdd:
+            try:
+                mmdd_sorted = sorted(seen_mmdd)
+                newest = mmdd_sorted[-1]; oldest = mmdd_sorted[0]
+                write_ptt_log(time.time(), f"[PTT_PAGE_DATE_STATS] page={pages+1} today_seen={sum(1 for e in entries if e.get('full_date')==today_str)} total_seen={len(entries)} newest={newest} oldest={oldest}", None)
+            except Exception as _:
+                write_ptt_log(time.time(), f"[PTT_PAGE_DATE_STATS_ERR] page={pages+1}", None)
+
+        # 僅保留今日條目，再依目標前綴過濾
+        entries_today = [e for e in entries if e.get("full_date") == today_str]
+        entries_today = filter_by_target_prefix(entries_today, TARGET_PREFIXES)
+
+        # [新增] 印出本頁每一筆抓到的原始條目（過濾後）
+        for i, e in enumerate(entries_today, start=1):
+            write_ptt_log(time.time(), f"[PTT][RAW] page={pages+1} idx={i}, date={e.get('full_date')} mmdd={e.get('ptt_mmdd')}, prefix={e.get('prefix')}, title={e.get('title')}, title_no_prefix={e.get('title_no_prefix')}, url={e.get('url')}", None)
+
+        # 分桶：BOX 與 情報（情報需再分類為合約/傷病/其他）
+        for e in entries_today:
+            if e.get("prefix") == "BOX":
+                buckets["BOX"].append(e)
+            elif e.get("prefix") == "情報":
+                k = classify_info(e.get("title", ""))
+                buckets[k].append(e)
+
+        # 繼續往上一頁
+        prev_url = find_prev_page_url(html)
+        if not prev_url:
+            break  # 沒有上一頁或結構變動：停止
+        current_url = prev_url
+        pages += 1
+    write_ptt_log(time.time(), buckets, None)
+
+    return buckets  # 回傳分類後的今日文章集合
+
+# --- PTT：頻道歷史 URL 去重工具（僅限 https://www.ptt.cc/bbs/NBA/ 基底） ---
+def normalize_url(u: str) -> str:
+    # 去除末尾常見標點/括號
+    return u.rstrip(').,;!?>"]\'')
+
+def is_ptt_nba_url(u: str) -> bool:
+    return isinstance(u, str) and u.startswith(PTT_BASE)
+
+def extract_urls_from_message(msg) -> set:
+    urls = set()
+
+    # 文字內容
+    content = getattr(msg, "content", None)
+    if content:
+        for m in URL_RE.findall(content):
+            u = normalize_url(m)
+            if is_ptt_nba_url(u):
+                urls.add(u)
+
+    # embeds
+    embeds = getattr(msg, "embeds", None)
+    if embeds:
+        for emb in embeds:
+            # 直接 URL 欄位
+            if getattr(emb, "url", None):
+                u = normalize_url(emb.url)
+                if is_ptt_nba_url(u):
+                    urls.add(u)
+            # 圖片/縮圖的 URL
+            thumb = getattr(emb, "thumbnail", None)
+            if thumb and getattr(thumb, "url", None):
+                u = normalize_url(thumb.url)
+                if is_ptt_nba_url(u):
+                    urls.add(u)
+            image = getattr(emb, "image", None)
+            if image and getattr(image, "url", None):
+                u = normalize_url(image.url)
+                if is_ptt_nba_url(u):
+                    urls.add(u)
+            # 也可掃 emb.description/fields 文字（視需求再加）
+
+    # 附件
+    attachments = getattr(msg, "attachments", None)
+    if attachments:
+        for att in attachments:
+            if getattr(att, "url", None):
+                u = normalize_url(att.url)
+                if is_ptt_nba_url(u):
+                    urls.add(u)
+
+    return urls
+
+async def collect_seen_ptt_urls_from_channel(channel, limit: int = 20) -> set:
+    seen = set()
+    try:
+        async for msg in channel.history(limit=limit):
+            seen |= extract_urls_from_message(msg)
+    except Exception as e:
+        print(f"[WARN] fetch history failed ch={getattr(channel,'id',None)} err={e}")
+    return seen
+
+# --- PTT：AsaBox（抓取/推送/心跳/去重與日誌） ---
+
 # ===== AsaBox：PTT 抓取推送（含錨點 + 日誌 + 自動去重，含日誌）=====
 # AsaBox 類別繼承自 discord.Client，負責：
 # - 啟動後載入錨點（避免重覆推送）
@@ -1248,9 +1215,6 @@ class AsaBox(discord.Client):
 
         # 初始化基類 discord.Client，確保事件迴圈、連線等基礎功能正常
         super().__init__(*args, **kwargs)
-
-        # 建立錨點管理器，用來記錄各分類最後處理到的項目，避免重覆推送
-        self.anchor_mgr = ChannelAnchorManager()
 
         # 記錄 AsaBox 啟動時間（UNIX timestamp），用於日誌與狀態輸出
         self.started_at = time.time()
@@ -1276,10 +1240,6 @@ class AsaBox(discord.Client):
         # 記錄就緒事件到日誌，
         # 含帳號資訊以便追蹤
         write_ptt_log(self.started_at, f"[READY] AsaBox logged in as {self.user}", None)
-
-        # 從持久化存儲載入各分類錨點，
-        # 確保不會重覆推送已處理內容
-        await self.anchor_mgr.load_last_anchors(self, started_at=self.started_at)
 
         # 啟動心跳協程，
         # 定期輸出心跳以觀察服務存活
@@ -1522,26 +1482,9 @@ class AsaBox(discord.Client):
                 # 下一輪再由事件迴圈喚醒
                 await asyncio.sleep(FETCH_INTERVAL)
 
-async def run_bot_with_retry(client, token: str, name: str, retry_delay: int = 30):
-
-    # 無窮重試迴圈，
-    # 確保機器人在錯誤後能自動恢復
-    while True:
-        try:
-            # 啟動 Discord 客戶端，
-            # 進入連線與事件迴圈
-            await client.start(token)
-        except Exception as e:
-            # 記錄啟動錯誤，
-            # 並輸出重試等待秒數
-            print(f"[{name}] error: {e}, retry in {retry_delay}s")
-
-            # 寫入錯誤日誌，
-            # 帶上目前時間戳與錯誤訊息
-            write_ptt_log(time.time(), f"{name}_ERROR", str(e))
-
-            # 睡眠 retry_delay 秒後重試
-            await asyncio.sleep(retry_delay)
+# =========================
+# 主程式入口（同時跑兩個 Bot + YT 背景）
+# =========================
 async def main():
 
     # 建立兩個 Discord Client 實例：
